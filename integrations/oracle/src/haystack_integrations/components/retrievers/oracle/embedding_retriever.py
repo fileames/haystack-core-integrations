@@ -27,6 +27,7 @@ class OracleEmbeddingRetriever:
 
     Example:
     ```python
+    import os
     from haystack import Document, Pipeline
     from haystack.document_stores.types import DuplicatePolicy
 
@@ -39,7 +40,7 @@ class OracleEmbeddingRetriever:
 
     # Create the document store (adjust connection params)
     store = OracleDocumentStore(
-        connection_params={"dsn": "user/password@HOST:PORT/SERVICE"},
+        connection_params={"dsn": os.environ["ORACLE_DB_DSN"]},
         table_name="documents",
         embedding_dim=768,
         create_vector_index=True,  # optional but recommended
@@ -54,7 +55,7 @@ class OracleEmbeddingRetriever:
     ]
 
     doc_embedder = OracleDocumentEmbedder(
-        connection_params={"dsn": "user/password@HOST:PORT/SERVICE"},
+        connection_params={"dsn": os.environ["ORACLE_DB_DSN"]},
         embedding_params={"provider": "database", "model": "ALL_MINILM_L12_V2"},
         proxy=None,
         use_connection_pool=False,
@@ -68,7 +69,7 @@ class OracleEmbeddingRetriever:
     pipe.add_component(
         "text_embedder",
         OracleTextEmbedder(
-            connection_params={"dsn": "user/password@HOST:PORT/SERVICE"},
+            connection_params={"dsn": os.environ["ORACLE_DB_DSN"]},
             embedding_params={"provider": "database", "model": "ALL_MINILM_L12_V2"},
             proxy=None,
             use_connection_pool=False,

@@ -1,11 +1,13 @@
 import array
 import functools
+import importlib
 import inspect
+import json
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
-from typing import Any, AsyncIterator, Iterator, Literal, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional, TypeVar, cast
 
 import oracledb
 from haystack import default_from_dict, default_to_dict, logging
@@ -17,6 +19,9 @@ from haystack.errors import FilterError
 from .filters import _get_filter_string
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from haystack_integrations.components.embedders.oracle import OracleTextEmbedder
 
 DistanceStrategy = Literal["dot", "euclidean", "cosine"]
 EmbeddingField = Literal["embedding", "sparse_embedding"]
@@ -151,6 +156,17 @@ def _compare_version(version: str, target_version: str) -> bool:
 
 DUPLICATE_ERROR = 942
 
+BASE_DOCUMENT_COLUMNS = [
+    "id",
+    "content",
+    "blob_data",
+    "blob_meta",
+    "blob_mime_type",
+    "meta",
+    "score",
+    "embedding",
+]
+
 
 def _table_exists(connection: oracledb.Connection, table_name: str) -> bool:
     try:
@@ -176,7 +192,7 @@ async def _table_exists_async(connection: oracledb.AsyncConnection, table_name: 
         raise
 
 
-def _get_table_dict(embedding_dim: int | None) -> dict[str, str]:
+def _get_table_dict(embedding_dim: int | None, *, support_sparse_embeddings: bool) -> dict[str, str]:
     cols_dict = {
         "id": "VARCHAR(128) PRIMARY KEY",
         "content": "CLOB",
@@ -186,13 +202,20 @@ def _get_table_dict(embedding_dim: int | None) -> dict[str, str]:
         "meta": "JSON",
         "score": "FLOAT",
         "embedding": f"vector({embedding_dim if embedding_dim else '*'}, FLOAT32)",
-        "sparse_embedding": f"vector({embedding_dim if embedding_dim else '*'}, FLOAT32, SPARSE)",
     }
+    if support_sparse_embeddings:
+        cols_dict["sparse_embedding"] = f"vector({embedding_dim if embedding_dim else '*'}, FLOAT32, SPARSE)"
     return cols_dict
 
 
-def _create_table(connection: oracledb.Connection, table_name: str, embedding_dim: int | None) -> None:
-    cols_dict = _get_table_dict(embedding_dim)
+def _create_table(
+    connection: oracledb.Connection,
+    table_name: str,
+    embedding_dim: int | None,
+    *,
+    support_sparse_embeddings: bool,
+) -> None:
+    cols_dict = _get_table_dict(embedding_dim, support_sparse_embeddings=support_sparse_embeddings)
 
     if not _table_exists(connection, table_name):
         with connection.cursor() as cursor:
@@ -205,9 +228,13 @@ def _create_table(connection: oracledb.Connection, table_name: str, embedding_di
 
 
 async def _create_table_async(
-    connection: oracledb.AsyncConnection, table_name: str, embedding_dim: int | None
+    connection: oracledb.AsyncConnection,
+    table_name: str,
+    embedding_dim: int | None,
+    *,
+    support_sparse_embeddings: bool,
 ) -> None:
-    cols_dict = _get_table_dict(embedding_dim)
+    cols_dict = _get_table_dict(embedding_dim, support_sparse_embeddings=support_sparse_embeddings)
 
     if not await _table_exists_async(connection, table_name):
         with connection.cursor() as cursor:
@@ -249,6 +276,13 @@ def _quote_indentifier(name: str) -> str:
     groups = [f'"{g}"' for g in groups]
 
     return ".".join(groups)
+
+
+def _validate_text_index_column(column_name: str) -> str:
+    normalized = column_name.strip().lower()
+    if normalized != "content":
+        raise ValueError("Oracle text indexing currently supports only the 'content' column.")
+    return normalized
 
 
 ################### INDEX
@@ -301,6 +335,41 @@ async def _index_exists_async(
 def _get_index_name(base_name: str) -> str:
     unique_id = str(uuid.uuid4()).replace("-", "")
     return f'"{base_name}_{unique_id}"'
+
+
+def _get_text_index_ddl(table_name: str, idx_name: str, column_name: str = "content") -> str:
+    validated_column = _validate_text_index_column(column_name)
+    return f"CREATE SEARCH INDEX {idx_name} ON {table_name}({validated_column})"
+
+
+def _create_text_index(
+    connection: oracledb.Connection,
+    table_name: str,
+    idx_name: str,
+    column_name: str = "content",
+) -> None:
+    ddl = _get_text_index_ddl(table_name, idx_name, column_name)
+    if not _index_exists(connection, idx_name, table_name):
+        with connection.cursor() as cursor:
+            cursor.execute(ddl)
+            logger.info(f"Text index {idx_name} created successfully...")
+    else:
+        logger.info(f"Text index {idx_name} already exists...")
+
+
+async def _create_text_index_async(
+    connection: oracledb.AsyncConnection,
+    table_name: str,
+    idx_name: str,
+    column_name: str = "content",
+) -> None:
+    ddl = _get_text_index_ddl(table_name, idx_name, column_name)
+    if not await _index_exists_async(connection, idx_name, table_name):
+        with connection.cursor() as cursor:
+            await cursor.execute(ddl)
+            logger.info(f"Text index {idx_name} created successfully...")
+    else:
+        logger.info(f"Text index {idx_name} already exists...")
 
 
 def _get_hnsw_index_ddl(
@@ -504,31 +573,248 @@ def output_type_string_handler(cursor: Any, metadata: Any) -> Any:
         return cursor.var(oracledb.DB_TYPE_LONG_RAW, arraysize=cursor.arraysize)
 
 
-MERGE_QUERY = """
+def _get_document_columns(*, support_sparse_embeddings: bool) -> list[str]:
+    columns = list(BASE_DOCUMENT_COLUMNS)
+    if support_sparse_embeddings:
+        columns.append("sparse_embedding")
+    return columns
+
+
+def _get_insert_query(table_name: str, policy: str, *, support_sparse_embeddings: bool) -> str:
+    columns = _get_document_columns(support_sparse_embeddings=support_sparse_embeddings)
+    placeholders = ", ".join(f":{i}" for i in range(1, len(columns) + 1))
+    return f"""INSERT {policy} INTO {table_name}
+    ({", ".join(columns)})
+    VALUES ({placeholders})"""
+
+
+def _get_merge_query(table_name: str, *, support_sparse_embeddings: bool) -> str:
+    columns = _get_document_columns(support_sparse_embeddings=support_sparse_embeddings)
+    source_select = ", ".join(f":{i} AS {column}" for i, column in enumerate(columns, start=1))
+    update_columns = ",\n            ".join(f"t.{column} = s.{column}" for column in columns if column != "id")
+    insert_columns = ", ".join(columns)
+    insert_values = ", ".join(f"s.{column}" for column in columns)
+    return f"""
     MERGE INTO {table_name} t
-    USING (SELECT :1 AS id, :2 AS content, :3 AS blob_data, :4 AS blob_meta,
-                :5 AS blob_mime_type, :6 AS meta, :7 AS score, :8 AS embedding,
-                :9 AS sparse_embedding FROM dual) s
+    USING (SELECT {source_select} FROM dual) s
     ON (t.id = s.id)
     WHEN MATCHED THEN
         UPDATE SET
-            t.content = s.content,
-            t.blob_data = s.blob_data,
-            t.blob_meta = s.blob_meta,
-            t.blob_mime_type = s.blob_mime_type,
-            t.meta = s.meta,
-            t.score = s.score,
-            t.embedding = s.embedding,
-            t.sparse_embedding = s.sparse_embedding
+            {update_columns}
     WHEN NOT MATCHED THEN
-        INSERT (id, content, blob_data, blob_meta,
-            blob_mime_type, meta, score, embedding, sparse_embedding)
-        VALUES (s.id, s.content, s.blob_data, s.blob_meta,
-            s.blob_mime_type, s.meta, s.score, s.embedding, s.sparse_embedding);"""
+        INSERT ({insert_columns})
+        VALUES ({insert_values});"""
 
-INSERT_QUERY = """INSERT {policy} INTO {table_name}
-    (id, content, blob_data, blob_meta, blob_mime_type, meta, score, embedding, sparse_embedding)
-    VALUES (:1, :2, :3, :4, :5, :6, :7, :8, :9)"""
+
+def _normalize_sparse_vector_index_config(
+    sparse_vector_index: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if sparse_vector_index is None:
+        return None
+
+    valid_keys = {"enabled", "distance_strategy", "params"}
+    invalid_keys = set(sparse_vector_index) - valid_keys
+    if invalid_keys:
+        invalid_keys_text = ", ".join(sorted(invalid_keys))
+        raise ValueError(f"Invalid sparse_vector_index parameter(s): {invalid_keys_text}")
+
+    enabled = sparse_vector_index.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("sparse_vector_index.enabled must be a boolean.")
+
+    normalized: dict[str, Any] = {"enabled": enabled}
+    if not enabled:
+        return normalized
+
+    distance_strategy = sparse_vector_index.get("distance_strategy", "cosine")
+    if distance_strategy not in VALID_DISTANCE_FUNCTIONS:
+        raise ValueError(
+            f"Invalid distance_function: '{distance_strategy}' for vector similarity. "
+            f"Valid options are: {VALID_DISTANCE_FUNCTIONS}."
+        )
+
+    params = sparse_vector_index.get("params")
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("sparse_vector_index.params must be a dictionary when provided.")
+
+    normalized["distance_strategy"] = distance_strategy
+    normalized["params"] = params
+    return normalized
+
+
+def _validate_vectorizer_parameters(
+    embedding_params: dict[str, Any],
+    params: dict[str, Any],
+) -> bool:
+    if "model" in params:
+        model_name = params["model"]
+        if embedding_params.get("provider") != "database" or embedding_params.get("model") != model_name:
+            raise ValueError(
+                "Mismatch between text_embedder and provided params: expected "
+                f"provider='database' and model='{embedding_params.get('model')}', "
+                f"but received model='{model_name}'."
+            )
+        return True
+
+    if "embedder_spec" in params:
+        if json.dumps(embedding_params, sort_keys=True) != json.dumps(params["embedder_spec"], sort_keys=True):
+            raise ValueError(
+                "Mismatch between text_embedder and provided params: embedder_spec must exactly match "
+                "text_embedder.embedding_params after JSON normalization."
+            )
+        return True
+
+    return False
+
+
+def _get_vectorizer_preference_parameters(
+    text_embedder: "OracleTextEmbedder",
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    preference_params = params.copy() if params else {}
+    embedding_params = text_embedder._embedding_params
+    has_model_config = _validate_vectorizer_parameters(embedding_params, preference_params)
+
+    if not has_model_config:
+        if embedding_params.get("provider") == "database":
+            preference_params["model"] = embedding_params.get("model")
+        else:
+            preference_params["embedder_spec"] = embedding_params
+
+    return preference_params
+
+
+def _validate_text_embedder_instance(text_embedder: Any) -> None:
+    oracle_embedder_module = importlib.import_module("haystack_integrations.components.embedders.oracle")
+    oracle_text_embedder = oracle_embedder_module.OracleTextEmbedder
+    if not isinstance(text_embedder, oracle_text_embedder):
+        raise ValueError("text_embedder must be an instance of OracleTextEmbedder")
+
+
+class OracleVectorizerPreference:
+    """Manage DBMS_VECTOR_CHAIN vectorizer preferences for Oracle hybrid indexes."""
+
+    PREFERENCE_CREATE_DDL = """
+    begin
+    dbms_vector_chain.CREATE_PREFERENCE(
+        :1,
+        dbms_vector_chain.vectorizer,
+        json(:2));
+    end;"""
+
+    PREFERENCE_DROP_DDL = "begin DBMS_VECTOR_CHAIN.DROP_PREFERENCE (:preference_name); end;"
+
+    def __init__(self, document_store: "OracleDocumentStore", preference_name: str):
+        self.document_store = document_store
+        self.preference_name = preference_name
+
+    @classmethod
+    @_handle_exceptions
+    def create(
+        cls,
+        document_store: "OracleDocumentStore",
+        text_embedder: "OracleTextEmbedder",
+        preference_name: str | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> "OracleVectorizerPreference":
+        if not isinstance(document_store, OracleDocumentStore):
+            raise ValueError("document_store must be an instance of OracleDocumentStore")
+        _validate_text_embedder_instance(text_embedder)
+
+        preference = cls(document_store, preference_name or f"pref{uuid.uuid4().hex[:15]}")
+        preference_params = _get_vectorizer_preference_parameters(text_embedder, params)
+
+        document_store._ensure_initialized()
+        with _get_connection(document_store._client) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    cls.PREFERENCE_CREATE_DDL,
+                    [preference.preference_name, json.dumps(preference_params)],
+                )
+        return preference
+
+    @classmethod
+    @_handle_exceptions_async
+    async def create_async(
+        cls,
+        document_store: "OracleDocumentStore",
+        text_embedder: "OracleTextEmbedder",
+        preference_name: str | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> "OracleVectorizerPreference":
+        if not isinstance(document_store, OracleDocumentStore):
+            raise ValueError("document_store must be an instance of OracleDocumentStore")
+        _validate_text_embedder_instance(text_embedder)
+
+        preference = cls(document_store, preference_name or f"pref{uuid.uuid4().hex[:15]}")
+        preference_params = _get_vectorizer_preference_parameters(text_embedder, params)
+
+        await document_store._ensure_initialized_async()
+        async with _get_connection_async(document_store._client_async) as connection:
+            with connection.cursor() as cursor:
+                await cursor.execute(
+                    cls.PREFERENCE_CREATE_DDL,
+                    [preference.preference_name, json.dumps(preference_params)],
+                )
+        return preference
+
+    @_handle_exceptions
+    def drop(self) -> None:
+        self.document_store._ensure_initialized()
+        with _get_connection(self.document_store._client) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(self.PREFERENCE_DROP_DDL, preference_name=self.preference_name)
+
+    @_handle_exceptions_async
+    async def drop_async(self) -> None:
+        await self.document_store._ensure_initialized_async()
+        async with _get_connection_async(self.document_store._client_async) as connection:
+            with connection.cursor() as cursor:
+                await cursor.execute(self.PREFERENCE_DROP_DDL, preference_name=self.preference_name)
+
+
+def _get_hybrid_index_ddl(
+    table_name: str,
+    idx_name: str,
+    vectorizer_preference: OracleVectorizerPreference,
+    params: dict[str, Any] | None = None,
+) -> str:
+    params = params or {}
+    index_parameters = params.get("parameters", {}).copy()
+    if any(key.lower() in {"model", "embedder_spec", "vectorizer", "vector_idxtype"} for key in index_parameters):
+        raise ValueError(
+            "Vectorization parameters must be given with OracleVectorizerPreference: do not include any of "
+            "{model, embedder_spec, vectorizer, vector_idxtype} under params['parameters']."
+        )
+
+    params_str = f"vectorizer {vectorizer_preference.preference_name} "
+    for key, value in index_parameters.items():
+        params_str += f"{key} {value} "
+
+    filter_by_str = ""
+    filter_by = params.get("filter_by")
+    if filter_by:
+        filter_by_str = "FILTER BY " + ",".join(filter_by) + " "
+
+    order_by_str = ""
+    order_by = params.get("order_by")
+    order_by_asc = params.get("order_by_asc", True)
+    if order_by:
+        order_by_str = "ORDER BY " + ",".join(order_by) + f" {'ASC' if order_by_asc else 'DESC'} "
+
+    parallel_str = ""
+    parallel = params.get("parallel")
+    if parallel is not None:
+        if not isinstance(parallel, int):
+            raise ValueError("parallel must be int")
+        parallel_str = f"PARALLEL {parallel} "
+
+    escaped_params_str = params_str.replace("'", "''")
+    return (
+        f"CREATE HYBRID VECTOR INDEX {idx_name} ON {table_name}(content) "
+        f"PARAMETERS ('{escaped_params_str}') "
+        f"{filter_by_str}{order_by_str}{parallel_str}"
+    )
 
 
 class OracleDocumentStore:
@@ -543,10 +829,12 @@ class OracleDocumentStore:
         *,
         use_connection_pool: bool = False,
         embedding_dim: Optional[int] = None,
+        support_sparse_embeddings: bool = True,
         create_vector_index: bool = False,
         vector_index_params: dict[str, Any] | None = None,
         vector_index_embedding_field: EmbeddingField = "embedding",
         vector_index_distance_strategy: DistanceStrategy = "cosine",
+        sparse_vector_index: dict[str, Any] | None = None,
     ):
         """
         Create a new OracleDocumentStore instance.
@@ -558,12 +846,16 @@ class OracleDocumentStore:
         :param use_connection_pool: If `True`, create and use an Oracle connection pool.
         :param embedding_dim: Optional dense and sparse embedding dimension for Oracle VECTOR columns.
             If omitted, the VECTOR columns are created with flexible dimensions.
+        :param support_sparse_embeddings: If `True`, create support for sparse embeddings in the table schema
+            and allow sparse retrieval and writes.
         :param create_vector_index: If `True`, create a vector index during initialization.
         :param vector_index_params: Optional Oracle vector index parameters. Supported index types are `HNSW` and `IVF`.
         :param vector_index_embedding_field: VECTOR column to index. Must be either `embedding`
             or `sparse_embedding`.
         :param vector_index_distance_strategy: Distance strategy to use for vector indexing and retrieval.
             Must be one of `dot`, `euclidean`, or `cosine`.
+        :param sparse_vector_index: Optional sparse vector index configuration. Supported keys are
+            `enabled`, `distance_strategy`, and `params`.
         """
 
         # Store the params for marshalling
@@ -571,6 +863,7 @@ class OracleDocumentStore:
         self._use_connection_pool = use_connection_pool
         self._table_name = _quote_indentifier(table_name)
         self._embedding_dim = embedding_dim
+        self._support_sparse_embeddings = support_sparse_embeddings
         self._create_vector_index = create_vector_index
         self._vector_index_params = vector_index_params
         if vector_index_distance_strategy not in VALID_DISTANCE_FUNCTIONS:
@@ -586,6 +879,24 @@ class OracleDocumentStore:
                 f"Valid options are: {['embedding', 'sparse_embedding']}."
             )
             raise ValueError(error_message)
+
+        if not support_sparse_embeddings and vector_index_embedding_field == "sparse_embedding":
+            raise ValueError("vector_index_embedding_field='sparse_embedding' requires support_sparse_embeddings=True.")
+
+        self._sparse_vector_index = _normalize_sparse_vector_index_config(sparse_vector_index)
+        if not support_sparse_embeddings and self._sparse_vector_index and self._sparse_vector_index.get("enabled"):
+            raise ValueError("sparse_vector_index.enabled requires support_sparse_embeddings=True.")
+
+        if (
+            self._sparse_vector_index
+            and self._sparse_vector_index.get("enabled")
+            and create_vector_index
+            and vector_index_embedding_field == "sparse_embedding"
+        ):
+            raise ValueError(
+                "Configure sparse index either with sparse_vector_index or with the legacy "
+                "vector_index_embedding_field='sparse_embedding', not both."
+            )
 
         self._vector_index_embedding_field: EmbeddingField = vector_index_embedding_field
         self._vector_index_distance_strategy: DistanceStrategy = vector_index_distance_strategy
@@ -623,10 +934,18 @@ class OracleDocumentStore:
                     connection,
                     self._table_name,
                     self._embedding_dim,
+                    support_sparse_embeddings=self._support_sparse_embeddings,
                 )
 
             if self._create_vector_index:
                 self._create_index(connection, self._vector_index_params)
+
+            if self._sparse_vector_index and self._sparse_vector_index.get("enabled"):
+                self._create_sparse_index(
+                    connection,
+                    self._sparse_vector_index.get("params"),
+                    self._sparse_vector_index["distance_strategy"],
+                )
 
         self._initialized = True
 
@@ -654,10 +973,18 @@ class OracleDocumentStore:
                     connection,
                     self._table_name,
                     self._embedding_dim,
+                    support_sparse_embeddings=self._support_sparse_embeddings,
                 )
 
             if self._create_vector_index:
                 await self._create_index_async(connection, self._vector_index_params)
+
+            if self._sparse_vector_index and self._sparse_vector_index.get("enabled"):
+                await self._create_sparse_index_async(
+                    connection,
+                    self._sparse_vector_index.get("params"),
+                    self._sparse_vector_index["distance_strategy"],
+                )
 
         await self._handle_context(context)
 
@@ -794,26 +1121,37 @@ class OracleDocumentStore:
                 msg = "'documents' must contain a list of Document"
                 raise ValueError(msg)
 
+        if not self._support_sparse_embeddings and any(doc.sparse_embedding for doc in documents):
+            raise ValueError("Sparse embeddings are not supported by this document store.")
+
         self._ensure_initialized()
-        embedding_dim = self._require_embedding_dim()
+        embedding_dim = self._require_embedding_dim() if any(doc.sparse_embedding for doc in documents) else None
         with _get_connection(self._client) as connection:
             with connection.cursor() as cursor:
-                cursor.setinputsizes(
-                    None, None, None, oracledb.DB_TYPE_JSON, None, oracledb.DB_TYPE_JSON, None, None, None
-                )
+                input_sizes = [None, None, None, oracledb.DB_TYPE_JSON, None, oracledb.DB_TYPE_JSON, None, None]
+                if self._support_sparse_embeddings:
+                    input_sizes.append(None)
+                cursor.setinputsizes(*input_sizes)
 
                 if policy == DuplicatePolicy.OVERWRITE:
-                    query = MERGE_QUERY.format(table_name=self._table_name)
+                    query = _get_merge_query(
+                        self._table_name, support_sparse_embeddings=self._support_sparse_embeddings
+                    )
 
                 else:
                     if policy == DuplicatePolicy.SKIP:
                         policy_hint = f"/*+ ignore_row_on_dupkey_index({self._table_name}(id)) */"
                     else:
                         policy_hint = ""
-                    query = INSERT_QUERY.format(table_name=self._table_name, policy=policy_hint)
+                    query = _get_insert_query(
+                        self._table_name,
+                        policy_hint,
+                        support_sparse_embeddings=self._support_sparse_embeddings,
+                    )
 
-                bind_input = [
-                    (
+                bind_input = []
+                for doc in documents:
+                    row = [
                         doc.id,
                         doc.content or None,
                         doc.blob.data if doc.blob else None,
@@ -822,16 +1160,18 @@ class OracleDocumentStore:
                         doc.meta or None,
                         doc.score or None,
                         array.array("f", doc.embedding) if doc.embedding else None,
-                        oracledb.SparseVector(
-                            embedding_dim,
-                            doc.sparse_embedding.indices,
-                            array.array("f", doc.sparse_embedding.values),
+                    ]
+                    if self._support_sparse_embeddings:
+                        row.append(
+                            oracledb.SparseVector(
+                                cast(int, embedding_dim),
+                                doc.sparse_embedding.indices,
+                                array.array("f", doc.sparse_embedding.values),
+                            )
+                            if doc.sparse_embedding
+                            else None
                         )
-                        if doc.sparse_embedding
-                        else None,
-                    )
-                    for doc in documents
-                ]
+                    bind_input.append(tuple(row))
 
                 cursor.executemany(
                     query,
@@ -867,29 +1207,40 @@ class OracleDocumentStore:
                 msg = "'documents' must contain a list of Document"
                 raise ValueError(msg)
 
+        if not self._support_sparse_embeddings and any(doc.sparse_embedding for doc in documents):
+            raise ValueError("Sparse embeddings are not supported by this document store.")
+
         await self._ensure_initialized_async()
-        embedding_dim = self._require_embedding_dim()
+        embedding_dim = self._require_embedding_dim() if any(doc.sparse_embedding for doc in documents) else None
 
         async def context(
             connection: oracledb.AsyncConnection,
         ) -> int:
             with connection.cursor() as cursor:
-                cursor.setinputsizes(
-                    None, None, None, oracledb.DB_TYPE_JSON, None, oracledb.DB_TYPE_JSON, None, None, None
-                )
+                input_sizes = [None, None, None, oracledb.DB_TYPE_JSON, None, oracledb.DB_TYPE_JSON, None, None]
+                if self._support_sparse_embeddings:
+                    input_sizes.append(None)
+                cursor.setinputsizes(*input_sizes)
 
                 if policy == DuplicatePolicy.OVERWRITE:
-                    query = MERGE_QUERY.format(table_name=self._table_name)
+                    query = _get_merge_query(
+                        self._table_name, support_sparse_embeddings=self._support_sparse_embeddings
+                    )
 
                 else:
                     if policy == DuplicatePolicy.SKIP:
                         policy_hint = f"/*+ ignore_row_on_dupkey_index({self._table_name}(id)) */"
                     else:
                         policy_hint = ""
-                    query = INSERT_QUERY.format(table_name=self._table_name, policy=policy_hint)
+                    query = _get_insert_query(
+                        self._table_name,
+                        policy_hint,
+                        support_sparse_embeddings=self._support_sparse_embeddings,
+                    )
 
-                bind_input = [
-                    (
+                bind_input = []
+                for doc in documents:
+                    row = [
                         doc.id,
                         doc.content or None,
                         doc.blob.data if doc.blob else None,
@@ -898,16 +1249,18 @@ class OracleDocumentStore:
                         doc.meta or None,
                         doc.score or None,
                         array.array("f", doc.embedding) if doc.embedding else None,
-                        oracledb.SparseVector(
-                            embedding_dim,
-                            doc.sparse_embedding.indices,
-                            array.array("f", doc.sparse_embedding.values),
+                    ]
+                    if self._support_sparse_embeddings:
+                        row.append(
+                            oracledb.SparseVector(
+                                cast(int, embedding_dim),
+                                doc.sparse_embedding.indices,
+                                array.array("f", doc.sparse_embedding.values),
+                            )
+                            if doc.sparse_embedding
+                            else None
                         )
-                        if doc.sparse_embedding
-                        else None,
-                    )
-                    for doc in documents
-                ]
+                    bind_input.append(tuple(row))
 
                 await cursor.executemany(
                     query,
@@ -1012,6 +1365,8 @@ class OracleDocumentStore:
         params: dict[str, Any]
 
         if isinstance(query_embedding, SparseEmbedding):
+            if not self._support_sparse_embeddings:
+                raise ValueError("Sparse embeddings are not supported by this document store.")
             embedding_dim = self._require_embedding_dim()
             column = "sparse_embedding"
             params = {
@@ -1065,6 +1420,8 @@ class OracleDocumentStore:
             params: dict[str, Any]
 
             if isinstance(query_embedding, SparseEmbedding):
+                if not self._support_sparse_embeddings:
+                    raise ValueError("Sparse embeddings are not supported by this document store.")
                 embedding_dim = self._require_embedding_dim()
                 column = "sparse_embedding"
                 params = {
@@ -1103,6 +1460,88 @@ class OracleDocumentStore:
 
         return await self._handle_context(context)
 
+    def _text_retrieval(
+        self,
+        query: str,
+        filters: Optional[dict[str, Any]] = None,
+        top_k: int = 10,
+    ) -> list[Document]:
+        self._ensure_initialized()
+
+        params: dict[str, Any] = {"query": query}
+        where_parts = ["CONTAINS(content, :query, 1) > 0"]
+        if filters:
+            bind_variables: list[Any] = []
+            where_parts.append(_get_filter_string(filters, "meta", bind_variables))
+            for i, value in enumerate(bind_variables):
+                params[f"value{i}"] = value
+
+        columns = [
+            column
+            for column in _get_document_columns(support_sparse_embeddings=self._support_sparse_embeddings)
+            if column != "score"
+        ]
+        selected_columns = ", ".join([*columns, "SCORE(1) AS score"])
+        db_query = f"""
+            SELECT {selected_columns}
+            FROM {self._table_name}
+            WHERE {" AND ".join(where_parts)}
+            ORDER BY SCORE(1) DESC
+            FETCH FIRST {top_k} ROWS ONLY
+            """
+
+        with _get_connection(self._client) as connection:
+            with connection.cursor() as cursor:
+                cursor.outputtypehandler = output_type_string_handler
+                cursor.execute(db_query, params)
+                result_columns = [col.name for col in cursor.description]
+                results = self._get_result_to_documents(cursor.fetchall(), result_columns)
+
+        return results
+
+    async def _text_retrieval_async(
+        self,
+        query: str,
+        filters: Optional[dict[str, Any]] = None,
+        top_k: int = 10,
+    ) -> list[Document]:
+        await self._ensure_initialized_async()
+
+        async def context(
+            connection: oracledb.AsyncConnection,
+        ) -> list[Document]:
+            params: dict[str, Any] = {"query": query}
+            where_parts = ["CONTAINS(content, :query, 1) > 0"]
+            if filters:
+                bind_variables: list[Any] = []
+                where_parts.append(_get_filter_string(filters, "meta", bind_variables))
+                for i, value in enumerate(bind_variables):
+                    params[f"value{i}"] = value
+
+            columns = [
+                column
+                for column in _get_document_columns(support_sparse_embeddings=self._support_sparse_embeddings)
+                if column != "score"
+            ]
+            selected_columns = ", ".join([*columns, "SCORE(1) AS score"])
+            db_query = f"""
+                SELECT {selected_columns}
+                FROM {self._table_name}
+                WHERE {" AND ".join(where_parts)}
+                ORDER BY SCORE(1) DESC
+                FETCH FIRST {top_k} ROWS ONLY
+                """
+
+            with connection.cursor() as cursor:
+                cursor.outputtypehandler = output_type_string_handler
+                await cursor.execute(db_query, params)
+                result_columns = [col.name for col in cursor.description]
+                results = self._get_result_to_documents(await cursor.fetchall(), result_columns)
+
+            return results
+
+        return await self._handle_context(context)
+
     async def _create_index_async(
         self, connection: oracledb.AsyncConnection, params: dict[str, Any] | None = None
     ) -> None:
@@ -1125,6 +1564,29 @@ class OracleDocumentStore:
                 connection, self._table_name, self._distance_strategy, params, self._vector_index_embedding_field
             )
 
+    async def _create_sparse_index_async(
+        self,
+        connection: oracledb.AsyncConnection,
+        params: dict[str, Any] | None,
+        distance_strategy: DistanceStrategy,
+    ) -> None:
+        if params and "idx_name" in params:
+            params["idx_name"] = _quote_indentifier(params["idx_name"])
+
+        if params:
+            if params["idx_type"] == "HNSW":
+                await _create_hnsw_index_async(
+                    connection, self._table_name, distance_strategy, params, "sparse_embedding"
+                )
+            elif params["idx_type"] == "IVF":
+                await _create_ivf_index_async(
+                    connection, self._table_name, distance_strategy, params, "sparse_embedding"
+                )
+            else:
+                raise ValueError("Only supported indexes HNSW and IVF")
+        else:
+            await _create_hnsw_index_async(connection, self._table_name, distance_strategy, params, "sparse_embedding")
+
     def _create_index(self, connection: oracledb.Connection, params: dict[str, Any] | None = None) -> None:
         if params and "idx_name" in params:
             params["idx_name"] = _quote_indentifier(params["idx_name"])
@@ -1144,6 +1606,107 @@ class OracleDocumentStore:
             _create_hnsw_index(
                 connection, self._table_name, self._distance_strategy, params, self._vector_index_embedding_field
             )
+
+    def _create_sparse_index(
+        self,
+        connection: oracledb.Connection,
+        params: dict[str, Any] | None,
+        distance_strategy: DistanceStrategy,
+    ) -> None:
+        if params and "idx_name" in params:
+            params["idx_name"] = _quote_indentifier(params["idx_name"])
+
+        if params:
+            if params["idx_type"] == "HNSW":
+                _create_hnsw_index(connection, self._table_name, distance_strategy, params, "sparse_embedding")
+            elif params["idx_type"] == "IVF":
+                _create_ivf_index(connection, self._table_name, distance_strategy, params, "sparse_embedding")
+            else:
+                raise ValueError("Only supported indexes HNSW and IVF")
+        else:
+            _create_hnsw_index(connection, self._table_name, distance_strategy, params, "sparse_embedding")
+
+    @_handle_exceptions
+    def create_hybrid_vector_index(
+        self,
+        idx_name: str,
+        *,
+        vectorizer_preference: OracleVectorizerPreference | None = None,
+        text_embedder: Optional["OracleTextEmbedder"] = None,
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        if (vectorizer_preference is None) == (text_embedder is None):
+            raise ValueError("Exactly one of 'vectorizer_preference' or 'text_embedder' must be provided.")
+
+        self._ensure_initialized()
+
+        should_drop_preference = False
+        if text_embedder is not None:
+            vectorizer_preference = OracleVectorizerPreference.create(self, text_embedder)
+            should_drop_preference = True
+
+        vectorizer_preference = cast(OracleVectorizerPreference, vectorizer_preference)
+        try:
+            quoted_idx_name = _quote_indentifier(idx_name)
+            ddl = _get_hybrid_index_ddl(self._table_name, quoted_idx_name, vectorizer_preference, params)
+
+            with _get_connection(self._client) as connection:
+                if not _index_exists(connection, quoted_idx_name, self._table_name):
+                    with connection.cursor() as cursor:
+                        cursor.execute(ddl)
+        finally:
+            if should_drop_preference:
+                vectorizer_preference.drop()
+
+    @_handle_exceptions_async
+    async def create_hybrid_vector_index_async(
+        self,
+        idx_name: str,
+        *,
+        vectorizer_preference: OracleVectorizerPreference | None = None,
+        text_embedder: Optional["OracleTextEmbedder"] = None,
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        if (vectorizer_preference is None) == (text_embedder is None):
+            raise ValueError("Exactly one of 'vectorizer_preference' or 'text_embedder' must be provided.")
+
+        await self._ensure_initialized_async()
+
+        should_drop_preference = False
+        if text_embedder is not None:
+            vectorizer_preference = await OracleVectorizerPreference.create_async(self, text_embedder)
+            should_drop_preference = True
+
+        vectorizer_preference = cast(OracleVectorizerPreference, vectorizer_preference)
+        try:
+            quoted_idx_name = _quote_indentifier(idx_name)
+            ddl = _get_hybrid_index_ddl(self._table_name, quoted_idx_name, vectorizer_preference, params)
+
+            async with _get_connection_async(self._client_async) as connection:
+                if not await _index_exists_async(connection, quoted_idx_name, self._table_name):
+                    with connection.cursor() as cursor:
+                        await cursor.execute(ddl)
+        finally:
+            if should_drop_preference:
+                await vectorizer_preference.drop_async()
+
+    @_handle_exceptions
+    def create_text_index(self, idx_name: str, *, column_name: str = "content") -> None:
+        self._ensure_initialized()
+        quoted_idx_name = _quote_indentifier(idx_name)
+        _validate_text_index_column(column_name)
+
+        with _get_connection(self._client) as connection:
+            _create_text_index(connection, self._table_name, quoted_idx_name, column_name)
+
+    @_handle_exceptions_async
+    async def create_text_index_async(self, idx_name: str, *, column_name: str = "content") -> None:
+        await self._ensure_initialized_async()
+        quoted_idx_name = _quote_indentifier(idx_name)
+        _validate_text_index_column(column_name)
+
+        async with _get_connection_async(self._client_async) as connection:
+            await _create_text_index_async(connection, self._table_name, quoted_idx_name, column_name)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "OracleDocumentStore":
@@ -1170,8 +1733,10 @@ class OracleDocumentStore:
             table_name=self._table_name,
             use_connection_pool=self._use_connection_pool,
             embedding_dim=self._embedding_dim,
+            support_sparse_embeddings=self._support_sparse_embeddings,
             create_vector_index=self._create_vector_index,
             vector_index_params=self._vector_index_params,
             vector_index_embedding_field=self._vector_index_embedding_field,
             vector_index_distance_strategy=self._vector_index_distance_strategy,
+            sparse_vector_index=self._sparse_vector_index,
         )

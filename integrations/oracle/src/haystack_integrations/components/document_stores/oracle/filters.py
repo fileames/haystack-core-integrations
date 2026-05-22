@@ -27,6 +27,16 @@ OPER_MAP = {
     "not in": "{0} NOT IN ({1})",  # Not in array (string or number)
 }
 
+HYBRID_OPER_MAP = {
+    "==": "=",
+    "!=": "!=",
+    ">": ">",
+    ">=": ">=",
+    "<": "<",
+    "<=": "<=",
+    "in": "IN",
+}
+
 
 def _convert_oper_to_sql(oper: str, metadata_column: str, filter_key: str, value_bind: str) -> str:
     filter_key = ".".join(filter_key.split(".")[1:])
@@ -108,3 +118,70 @@ def _get_filter_string(filters: dict[str, Any], metadata_column: str, bind_varia
         return f" NOT ( {not_statement} )"
     else:
         return f" {operator_upper} ".join(filter_strings)
+
+
+def _infer_hybrid_filter_type(value: Any) -> str:
+    if isinstance(value, bool):
+        raise FilterError("Boolean values are not supported for Oracle hybrid filters.")
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    raise FilterError(
+        "Oracle hybrid filters support only string and numeric values for Haystack-style filters."
+    )
+
+
+def _get_hybrid_filter_path(field: str) -> str:
+    if not re.match(r"^[a-zA-Z0-9_.]+$", field):
+        raise FilterError(f"Invalid metadata key format: {field}")
+    if not field.startswith("meta."):
+        raise FilterError("Oracle hybrid retrieval currently supports only metadata filters under the 'meta.' field.")
+    return field
+
+
+def _to_hybrid_filter(filters: dict[str, Any]) -> dict[str, Any]:
+    if filters.keys() != {"field", "value", "operator"} and filters.keys() != {"operator", "conditions"}:
+        raise FilterError("Filter structure is not correct!")
+
+    if "field" in filters:
+        field = _get_hybrid_filter_path(filters["field"])
+        operator = filters["operator"]
+        value = filters["value"]
+
+        if operator in {"contains", "not contains"}:
+            raise FilterError(f"Filter operation {operator} is not supported for Oracle hybrid retrieval.")
+        if value is None:
+            raise FilterError("Oracle hybrid retrieval does not support null comparisons in Haystack filters.")
+
+        if operator in {"in", "not in"}:
+            if not isinstance(value, list) or len(value) == 0:
+                raise FilterError(f"Type for field {field} not correct; expected non-empty list, got {type(value)}.")
+            value_type = _infer_hybrid_filter_type(value[0])
+            if any(_infer_hybrid_filter_type(item) != value_type for item in value):
+                raise FilterError(
+                    "Oracle hybrid retrieval requires all values in an 'in' filter to have the same type."
+                )
+            hybrid_filter: dict[str, Any] = {"op": "IN", "path": field, "type": value_type, "args": value}
+            if operator == "not in":
+                return {"op": "NOT", "args": [hybrid_filter]}
+            return hybrid_filter
+
+        if operator not in HYBRID_OPER_MAP:
+            raise FilterError(f"Filter operation {operator} cannot be used with this vector store.")
+
+        return {
+            "op": HYBRID_OPER_MAP[operator],
+            "path": field,
+            "type": _infer_hybrid_filter_type(value),
+            "args": [value],
+        }
+
+    operator = filters["operator"].upper()
+    if operator not in {"AND", "OR", "NOT"}:
+        raise FilterError(f"Invalid operator: {filters['operator']}")
+
+    return {
+        "op": operator,
+        "args": [_to_hybrid_filter(condition) for condition in filters["conditions"]],
+    }

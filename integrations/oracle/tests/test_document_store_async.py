@@ -11,13 +11,18 @@ from haystack.document_stores.errors import DuplicateDocumentError
 from haystack.document_stores.types import DuplicatePolicy
 
 from haystack_integrations.components.document_stores.oracle import OracleDocumentStore
-from .conftest import ORACLE_TESTS_CONFIGURED, ORACLE_TESTS_REASON, oracle_test_connection_params
+
+from .conftest import (
+    ORACLE_TESTS_CONFIGURED,
+    ORACLE_TESTS_REASON,
+    oracle_test_connection_params,
+    oracle_unit_test_connection_params,
+)
 
 
 class _AsyncFakeCursor:
-    async def execute(self, query, *args, **kwargs):
+    async def execute(self, query, *_args, **_kwargs):
         self.query = query
-        return None
 
     async def fetchone(self):
         return (3,)
@@ -47,7 +52,6 @@ class _AsyncFakePooledConnection:
 
     async def __aexit__(self, exc_type, exc, tb):
         self.released["value"] = True
-        return None
 
 
 class _AsyncFakePool:
@@ -78,6 +82,7 @@ async def document_store():
         connection_params=connection_params,
         table_name="mytable_haystack",
         embedding_dim=2500,
+        support_sparse_embeddings=False,
     )
 
     yield config
@@ -149,11 +154,12 @@ class TestDocumentStoreAsync:
 async def test_count_documents_async_releases_pooled_connection(monkeypatch):
     released = {"value": False}
     pool = _AsyncFakePool(_AsyncFakeConnection(), released)
+    connection_params = oracle_unit_test_connection_params()
 
     monkeypatch.setattr(oracledb, "AsyncConnectionPool", _AsyncFakePool, raising=False)
 
     store = OracleDocumentStore(
-        connection_params={"user": "u", "password": "p", "dsn": "d"},
+        connection_params=connection_params,
         table_name="docs",
         embedding_dim=4,
         use_connection_pool=True,
@@ -169,11 +175,12 @@ async def test_count_documents_async_releases_pooled_connection(monkeypatch):
 async def test_sparse_embedding_retrieval_async_requires_embedding_dim(monkeypatch):
     released = {"value": False}
     pool = _AsyncFakePool(_AsyncFakeConnection(), released)
+    connection_params = oracle_unit_test_connection_params()
 
     monkeypatch.setattr(oracledb, "AsyncConnectionPool", _AsyncFakePool, raising=False)
 
     store = OracleDocumentStore(
-        connection_params={"user": "u", "password": "p", "dsn": "d"},
+        connection_params=connection_params,
         table_name="docs",
         embedding_dim=None,
     )
@@ -181,5 +188,27 @@ async def test_sparse_embedding_retrieval_async_requires_embedding_dim(monkeypat
     store._initialized_async = True
 
     with pytest.raises(ValueError, match="embedding_dim must be set"):
+        await store._embedding_retrieval_async(SparseEmbedding(indices=[0], values=[1.0]))
+    assert released["value"] is True
+
+
+@pytest.mark.asyncio
+async def test_sparse_embedding_retrieval_async_requires_sparse_support(monkeypatch):
+    released = {"value": False}
+    pool = _AsyncFakePool(_AsyncFakeConnection(), released)
+    connection_params = oracle_unit_test_connection_params()
+
+    monkeypatch.setattr(oracledb, "AsyncConnectionPool", _AsyncFakePool, raising=False)
+
+    store = OracleDocumentStore(
+        connection_params=connection_params,
+        table_name="docs",
+        embedding_dim=4,
+        support_sparse_embeddings=False,
+    )
+    store._client_async = pool
+    store._initialized_async = True
+
+    with pytest.raises(ValueError, match="Sparse embeddings are not supported"):
         await store._embedding_retrieval_async(SparseEmbedding(indices=[0], values=[1.0]))
     assert released["value"] is True

@@ -16,9 +16,16 @@ from haystack.testing.document_store import (
     FilterDocumentsTest,
     WriteDocumentsTest,
 )
+
 from haystack_integrations.components.document_stores.oracle import OracleDocumentStore
 from haystack_integrations.components.document_stores.oracle.document_store import _get_connection, _index_exists
-from .conftest import ORACLE_TESTS_CONFIGURED, ORACLE_TESTS_REASON, oracle_test_connection_params
+
+from .conftest import (
+    ORACLE_TESTS_CONFIGURED,
+    ORACLE_TESTS_REASON,
+    oracle_test_connection_params,
+    oracle_unit_test_connection_params,
+)
 
 EMBEDDING_DIM = 768
 
@@ -30,7 +37,7 @@ class _FakeCursor:
     def __exit__(self, exc_type, exc, tb):
         return None
 
-    def execute(self, query, *args, **kwargs):
+    def execute(self, query, *_args, **_kwargs):
         self.query = query
 
     def fetchone(self):
@@ -55,7 +62,6 @@ class _FakePooledConnection:
 
     def __exit__(self, exc_type, exc, tb):
         self.released["value"] = True
-        return None
 
 
 class _FakePool:
@@ -65,6 +71,7 @@ class _FakePool:
 
     def acquire(self):
         return _FakePooledConnection(self.connection, self.released)
+
 
 def drop_table_purge(connection: oracledb.Connection, table_name: str) -> None:
     ddl = f'DROP TABLE IF EXISTS "{table_name}" PURGE'
@@ -80,19 +87,6 @@ def document_store(request):
 
     connection = oracledb.connect(**connection_params)
 
-    '''with connection.cursor() as cur:
-        cur.execute("select instance_name from v$instance")
-        print(cur.fetchall())
-
-        cur.execute("select name, value from v$parameter where name = 'compatible'")
-        print(cur.fetchall())
-
-        cur.execute("select banner_full from v$version")
-        print(cur.fetchall())
-
-        cur.execute("select sys_context('userenv','db_unique_name') db_unique_name, sys_context('userenv','con_name') con_name from dual")
-        print(cur.fetchall())'''
-
     table_name = f"mytable_haystack_{uuid.uuid4().hex[:8]}"
     index_name = f"myindex_haystack_{uuid.uuid4().hex[:8]}"
 
@@ -107,12 +101,14 @@ def document_store(request):
             connection_params=connection_params,
             table_name=table_name,
             embedding_dim=768,
+            support_sparse_embeddings=False,
         )
     elif store_type == "index":
         config = OracleDocumentStore(
             connection_params=connection_params,
             table_name=table_name,
             embedding_dim=768,
+            support_sparse_embeddings=False,
             create_vector_index=True,
             vector_index_params={"idx_name": index_name, "idx_type": "HNSW"},
         )
@@ -131,6 +127,7 @@ def document_store(request):
             connection_params=connection_params,
             table_name=table_name,
             embedding_dim=768,
+            support_sparse_embeddings=False,
             create_vector_index=True,
             vector_index_params={"idx_name": index_name, "idx_type": "HNSW"},
         )
@@ -168,13 +165,6 @@ class TestDocumentStore(FilterDocumentsTest, CountDocumentsTest, WriteDocumentsT
         a score to returned Documents. Since we can't know what the score will be, we can't compare
         the Documents reliably.
         """
-        # print("BURA", len(received), len(expected))
-        # print([(x.id, x.meta) for x in received])
-        # print([(x.id, x.meta) for x in expected])
-
-        # print(  set([x.id for x in expected]) - set([x.id for x in received]) )
-
-        # print(  set([x.id for x in received]) - set([x.id for x in expected]))
         assert {x.id for x in received} == {x.id for x in expected}
 
     # ISO filter not supported.
@@ -222,7 +212,11 @@ def test_index_exists(document_store: OracleDocumentStore):
 
     connection = oracledb.connect(**oracle_test_connection_params())
 
-    assert _index_exists(connection, table_name=f'"{document_store._table_name}"', index_name=f'"{document_store._vector_index_params["idx_name"]}"')
+    assert _index_exists(
+        connection,
+        table_name=f'"{document_store._table_name}"',
+        index_name=f'"{document_store._vector_index_params["idx_name"]}"',
+    )
 
 
 def test_get_connection_releases_sync_pooled_connection(monkeypatch):
@@ -241,11 +235,12 @@ def test_get_connection_releases_sync_pooled_connection(monkeypatch):
 def test_count_documents_releases_sync_pooled_connection(monkeypatch):
     released = {"value": False}
     pool = _FakePool(_FakeConnection(), released)
+    connection_params = oracle_unit_test_connection_params()
 
     monkeypatch.setattr(oracledb, "ConnectionPool", _FakePool, raising=False)
 
     store = OracleDocumentStore(
-        connection_params={"user": "u", "password": "p", "dsn": "d"},
+        connection_params=connection_params,
         table_name="docs",
         embedding_dim=4,
         use_connection_pool=True,
@@ -258,8 +253,9 @@ def test_count_documents_releases_sync_pooled_connection(monkeypatch):
 
 
 def test_write_documents_with_sparse_embedding_requires_embedding_dim():
+    connection_params = oracle_unit_test_connection_params()
     store = OracleDocumentStore(
-        connection_params={"user": "u", "password": "p", "dsn": "d"},
+        connection_params=connection_params,
         table_name="docs",
         embedding_dim=None,
     )
@@ -273,8 +269,9 @@ def test_write_documents_with_sparse_embedding_requires_embedding_dim():
 
 
 def test_sparse_embedding_retrieval_requires_embedding_dim():
+    connection_params = oracle_unit_test_connection_params()
     store = OracleDocumentStore(
-        connection_params={"user": "u", "password": "p", "dsn": "d"},
+        connection_params=connection_params,
         table_name="docs",
         embedding_dim=None,
     )
@@ -284,56 +281,141 @@ def test_sparse_embedding_retrieval_requires_embedding_dim():
         store._embedding_retrieval(SparseEmbedding(indices=[0], values=[1.0]))
 
 
-def test_document_store_to_dict_serializes_index_config():
+def test_write_documents_with_sparse_embedding_requires_sparse_support():
+    connection_params = oracle_unit_test_connection_params()
     store = OracleDocumentStore(
-        connection_params={"user": "u", "password": "p", "dsn": "d"},
+        connection_params=connection_params,
+        table_name="docs",
+        embedding_dim=4,
+        support_sparse_embeddings=False,
+    )
+    store._initialized = True
+
+    doc = Document(id="1", content="hello")
+    doc.sparse_embedding = SparseEmbedding(indices=[0], values=[1.0])
+
+    with pytest.raises(ValueError, match="Sparse embeddings are not supported"):
+        store.write_documents([doc])
+
+
+def test_sparse_embedding_retrieval_requires_sparse_support():
+    connection_params = oracle_unit_test_connection_params()
+    store = OracleDocumentStore(
+        connection_params=connection_params,
+        table_name="docs",
+        embedding_dim=4,
+        support_sparse_embeddings=False,
+    )
+    store._initialized = True
+
+    with pytest.raises(ValueError, match="Sparse embeddings are not supported"):
+        store._embedding_retrieval(SparseEmbedding(indices=[0], values=[1.0]))
+
+
+def test_sparse_vector_index_enabled_uses_defaults():
+    connection_params = oracle_unit_test_connection_params()
+    store = OracleDocumentStore(
+        connection_params=connection_params,
+        table_name="docs",
+        embedding_dim=768,
+        sparse_vector_index={"enabled": True},
+    )
+
+    assert store._sparse_vector_index == {
+        "enabled": True,
+        "distance_strategy": "cosine",
+        "params": None,
+    }
+
+
+def test_sparse_vector_index_requires_sparse_support():
+    connection_params = oracle_unit_test_connection_params()
+
+    with pytest.raises(ValueError, match="support_sparse_embeddings=True"):
+        OracleDocumentStore(
+            connection_params=connection_params,
+            table_name="docs",
+            embedding_dim=768,
+            support_sparse_embeddings=False,
+            sparse_vector_index={"enabled": True},
+        )
+
+
+def test_document_store_to_dict_serializes_index_config():
+    connection_params = oracle_unit_test_connection_params()
+    store = OracleDocumentStore(
+        connection_params=connection_params,
         table_name="docs",
         use_connection_pool=True,
         embedding_dim=768,
+        support_sparse_embeddings=True,
         create_vector_index=True,
         vector_index_params={"idx_name": "my_idx", "idx_type": "HNSW"},
-        vector_index_embedding_field="sparse_embedding",
         vector_index_distance_strategy="dot",
+        sparse_vector_index={
+            "enabled": True,
+            "distance_strategy": "dot",
+            "params": {"idx_name": "my_sparse_idx", "idx_type": "HNSW"},
+        },
     )
 
     assert store.to_dict() == {
         "type": "haystack_integrations.components.document_stores.oracle.document_store.OracleDocumentStore",
         "init_parameters": {
-            "connection_params": {"user": "u", "password": "p", "dsn": "d"},
+            "connection_params": connection_params,
             "table_name": '"docs"',
             "use_connection_pool": True,
             "embedding_dim": 768,
+            "support_sparse_embeddings": True,
             "create_vector_index": True,
             "vector_index_params": {"idx_name": "my_idx", "idx_type": "HNSW"},
-            "vector_index_embedding_field": "sparse_embedding",
+            "vector_index_embedding_field": "embedding",
             "vector_index_distance_strategy": "dot",
+            "sparse_vector_index": {
+                "enabled": True,
+                "distance_strategy": "dot",
+                "params": {"idx_name": "my_sparse_idx", "idx_type": "HNSW"},
+            },
         },
     }
 
 
 def test_document_store_from_dict_roundtrip_preserves_index_config():
+    connection_params = oracle_unit_test_connection_params()
     store = OracleDocumentStore.from_dict(
         {
             "type": "haystack_integrations.components.document_stores.oracle.document_store.OracleDocumentStore",
             "init_parameters": {
-                "connection_params": {"user": "u", "password": "p", "dsn": "d"},
+                "connection_params": connection_params,
                 "table_name": "docs",
                 "use_connection_pool": True,
                 "embedding_dim": 768,
+                "support_sparse_embeddings": True,
                 "create_vector_index": True,
                 "vector_index_params": {"idx_name": "my_idx", "idx_type": "HNSW"},
-                "vector_index_embedding_field": "sparse_embedding",
+                "vector_index_embedding_field": "embedding",
                 "vector_index_distance_strategy": "dot",
+                "sparse_vector_index": {
+                    "enabled": True,
+                    "distance_strategy": "dot",
+                    "params": {"idx_name": "my_sparse_idx", "idx_type": "HNSW"},
+                },
             },
         }
     )
 
-    assert store._connection_params == {"user": "u", "password": "p", "dsn": "d"}
+    assert store._connection_params == connection_params
     assert store._table_name == '"docs"'
     assert store._use_connection_pool is True
     assert store._embedding_dim == 768
+    assert store._support_sparse_embeddings is True
     assert store._create_vector_index is True
     assert store._vector_index_params == {"idx_name": "my_idx", "idx_type": "HNSW"}
-    assert store._vector_index_embedding_field == "sparse_embedding"
+    assert store._vector_index_embedding_field == "embedding"
     assert store._vector_index_distance_strategy == "dot"
     assert store._distance_strategy == "dot"
+    assert store._sparse_vector_index == {
+        "enabled": True,
+        "distance_strategy": "dot",
+        "params": {"idx_name": "my_sparse_idx", "idx_type": "HNSW"},
+    }

@@ -2,15 +2,22 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import pytest
+from unittest.mock import AsyncMock, Mock
+
 import oracledb
-from unittest.mock import Mock, AsyncMock
+import pytest
 from haystack.dataclasses import Document
 from haystack.document_stores.types import FilterPolicy
 
-from haystack_integrations.components.retrievers.oracle import OracleEmbeddingRetriever
 from haystack_integrations.components.document_stores.oracle import OracleDocumentStore
-from .conftest import ORACLE_TESTS_CONFIGURED, ORACLE_TESTS_REASON, oracle_test_connection_params
+from haystack_integrations.components.retrievers.oracle import OracleEmbeddingRetriever
+
+from .conftest import (
+    ORACLE_TESTS_CONFIGURED,
+    ORACLE_TESTS_REASON,
+    oracle_test_connection_params,
+    oracle_unit_test_connection_params,
+)
 
 
 def drop_table_purge(connection: oracledb.Connection, table_name: str) -> None:
@@ -35,6 +42,7 @@ def document_store():
         connection_params=connection_params,
         table_name=table_name,
         embedding_dim=4,
+        support_sparse_embeddings=False,
         create_vector_index=False,
     )
 
@@ -60,6 +68,9 @@ def test_init_validation():
     # invalid distance strategy
     with pytest.raises(ValueError):
         OracleEmbeddingRetriever(document_store=mock_store, distance_strategy="invalid")  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="document_store must be an instance"):
+        OracleEmbeddingRetriever(document_store=object())  # type: ignore[arg-type]
 
 
 @pytest.mark.skipif(not ORACLE_TESTS_CONFIGURED, reason=ORACLE_TESTS_REASON)
@@ -157,8 +168,9 @@ def test_to_dict_serialization(monkeypatch):
     """
     Ensure to_dict uses correct field names and values, and nests a serialized document store.
     """
+    connection_params = oracle_unit_test_connection_params()
     store = OracleDocumentStore(
-        connection_params={"user": "u", "password": "p", "dsn": "d"},
+        connection_params=connection_params,
         table_name="t",
         embedding_dim=768,
     )
@@ -170,7 +182,7 @@ def test_to_dict_serialization(monkeypatch):
         lambda: {
             "type": "haystack_integrations.components.document_stores.oracle.document_store.OracleDocumentStore",
             "init_parameters": {
-                "connection_params": {"user": "u", "password": "p", "dsn": "d"},
+                "connection_params": connection_params,
                 "table_name": "t",
                 "embedding_dim": 768,
             },
@@ -198,10 +210,11 @@ def test_from_dict_roundtrip_and_default_filter_policy():
     Ensure from_dict builds a retriever with a deserialized OracleDocumentStore and defaults filter_policy
     to REPLACE when missing.
     """
+    connection_params = oracle_unit_test_connection_params()
     base_doc_store_dict = {
         "type": "haystack_integrations.components.document_stores.oracle.document_store.OracleDocumentStore",
         "init_parameters": {
-            "connection_params": {"user": "u", "password": "p", "dsn": "d"},
+            "connection_params": connection_params,
             "table_name": "t",
             "embedding_dim": 768,
         },
@@ -242,9 +255,10 @@ def test_from_dict_roundtrip_and_default_filter_policy():
 
 
 def test_retriever_roundtrip_preserves_real_document_store():
+    connection_params = oracle_unit_test_connection_params()
     retriever = OracleEmbeddingRetriever(
         document_store=OracleDocumentStore(
-            connection_params={"user": "u", "password": "p", "dsn": "d"},
+            connection_params=connection_params,
             table_name="docs",
             embedding_dim=768,
             create_vector_index=True,
@@ -313,3 +327,23 @@ async def test_run_async_uses_instance_distance_strategy_when_not_overridden():
         top_k=10,
         distance_strategy="euclidean",
     )
+
+
+def test_run_rejects_invalid_distance_override():
+    mock_store = Mock(spec=OracleDocumentStore)
+    retriever = OracleEmbeddingRetriever(document_store=mock_store)
+
+    with pytest.raises(ValueError, match="Invalid distance_function"):
+        retriever.run(query_embedding=[0.1, 0.2, 0.3, 0.4], distance_strategy="bad")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_run_async_rejects_invalid_distance_override():
+    mock_store = Mock(spec=OracleDocumentStore)
+    retriever = OracleEmbeddingRetriever(document_store=mock_store)
+
+    with pytest.raises(ValueError, match="Invalid distance_function"):
+        await retriever.run_async(
+            query_embedding=[0.1, 0.2, 0.3, 0.4],
+            distance_strategy="bad",  # type: ignore[arg-type]
+        )

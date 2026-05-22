@@ -2,6 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .document_store import OracleDocumentStore
+from .document_store import OracleDocumentStore, OracleVectorizerPreference
 
-__all__ = ["OracleDocumentStore"]
+__all__ = ["OracleDocumentStore", "OracleVectorizerPreference"]

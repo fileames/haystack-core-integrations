@@ -2,17 +2,24 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import pytest
-import oracledb
 from unittest.mock import AsyncMock, Mock
+
+import oracledb
+import pytest
 from haystack.dataclasses import Document, SparseEmbedding
 from haystack.document_stores.types import FilterPolicy
 
+from haystack_integrations.components.document_stores.oracle import OracleDocumentStore
 from haystack_integrations.components.retrievers.oracle import (
     OracleSparseEmbeddingRetriever,
 )
-from haystack_integrations.components.document_stores.oracle import OracleDocumentStore
-from .conftest import ORACLE_TESTS_CONFIGURED, ORACLE_TESTS_REASON, oracle_test_connection_params
+
+from .conftest import (
+    ORACLE_TESTS_CONFIGURED,
+    ORACLE_TESTS_REASON,
+    oracle_test_connection_params,
+    oracle_unit_test_connection_params,
+)
 
 
 def drop_table_purge(connection: oracledb.Connection, table_name: str) -> None:
@@ -37,6 +44,7 @@ def sparse_document_store():
         connection_params=connection_params,
         table_name=table_name,
         embedding_dim=8,
+        support_sparse_embeddings=True,
         create_vector_index=False,
         vector_index_embedding_field="sparse_embedding",
     )
@@ -51,10 +59,12 @@ def test_sparse_retriever_init_and_serialize(monkeypatch):
     """
     Basic init and to_dict sanity for OracleSparseEmbeddingRetriever.
     """
+    connection_params = oracle_unit_test_connection_params()
     store = OracleDocumentStore(
-        connection_params={"user": "u", "password": "p", "dsn": "d"},
+        connection_params=connection_params,
         table_name="t",
         embedding_dim=8,
+        support_sparse_embeddings=True,
         vector_index_embedding_field="sparse_embedding",
     )
 
@@ -65,7 +75,7 @@ def test_sparse_retriever_init_and_serialize(monkeypatch):
         lambda: {
             "type": "haystack_integrations.components.document_stores.oracle.document_store.OracleDocumentStore",
             "init_parameters": {
-                "connection_params": {"user": "u", "password": "p", "dsn": "d"},
+                "connection_params": connection_params,
                 "table_name": "t",
                 "embedding_dim": 8,
                 "vector_index_embedding_field": "sparse_embedding",
@@ -87,6 +97,36 @@ def test_sparse_retriever_init_and_serialize(monkeypatch):
     assert init["document_store"]["type"] == (
         "haystack_integrations.components.document_stores.oracle.document_store.OracleDocumentStore"
     )
+
+    with pytest.raises(ValueError, match="document_store must be an instance"):
+        OracleSparseEmbeddingRetriever(document_store=object())  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="Invalid distance_function"):
+        OracleSparseEmbeddingRetriever(document_store=store, distance_strategy="bad")  # type: ignore[arg-type]
+
+
+def test_sparse_from_dict_defaults_filter_policy_when_missing():
+    connection_params = oracle_unit_test_connection_params()
+    retriever = OracleSparseEmbeddingRetriever.from_dict(
+        {
+            "type": "haystack_integrations.components.retrievers.oracle.sparse_embedding_retriever.OracleSparseEmbeddingRetriever",
+            "init_parameters": {
+                "document_store": {
+                    "type": "haystack_integrations.components.document_stores.oracle.document_store.OracleDocumentStore",
+                    "init_parameters": {
+                        "connection_params": connection_params,
+                        "table_name": "t",
+                        "embedding_dim": 8,
+                    },
+                },
+                "filters": {},
+                "top_k": 3,
+                "distance_strategy": "cosine",
+            },
+        }
+    )
+
+    assert retriever.filter_policy == FilterPolicy.REPLACE
 
 
 def test_sparse_run_uses_instance_distance_strategy_when_not_overridden():
@@ -120,12 +160,37 @@ async def test_sparse_run_async_uses_instance_distance_strategy_when_not_overrid
     )
 
 
+def test_sparse_run_rejects_invalid_distance_override():
+    mock_store = Mock(spec=OracleDocumentStore)
+    retriever = OracleSparseEmbeddingRetriever(document_store=mock_store)
+
+    with pytest.raises(ValueError, match="Invalid distance_function"):
+        retriever.run(
+            query_sparse_embedding=SparseEmbedding(indices=[0], values=[1.0]),
+            distance_strategy="bad",  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
+async def test_sparse_run_async_rejects_invalid_distance_override():
+    mock_store = Mock(spec=OracleDocumentStore)
+    retriever = OracleSparseEmbeddingRetriever(document_store=mock_store)
+
+    with pytest.raises(ValueError, match="Invalid distance_function"):
+        await retriever.run_async(
+            query_sparse_embedding=SparseEmbedding(indices=[0], values=[1.0]),
+            distance_strategy="bad",  # type: ignore[arg-type]
+        )
+
+
 def test_sparse_retriever_roundtrip_preserves_real_document_store():
+    connection_params = oracle_unit_test_connection_params()
     retriever = OracleSparseEmbeddingRetriever(
         document_store=OracleDocumentStore(
-            connection_params={"user": "u", "password": "p", "dsn": "d"},
+            connection_params=connection_params,
             table_name="docs",
             embedding_dim=8,
+            support_sparse_embeddings=True,
             create_vector_index=True,
             vector_index_params={"idx_name": "my_sparse_idx", "idx_type": "HNSW"},
             vector_index_embedding_field="sparse_embedding",
