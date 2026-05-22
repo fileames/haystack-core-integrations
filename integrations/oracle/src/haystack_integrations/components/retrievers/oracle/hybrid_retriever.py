@@ -21,7 +21,7 @@ from haystack_integrations.components.document_stores.oracle import OracleDocume
 from haystack_integrations.components.document_stores.oracle.document_store import (
     _get_connection,
     _get_connection_async,
-    _quote_indentifier,
+    _quote_identifier,
     output_type_string_handler,
 )
 from haystack_integrations.components.document_stores.oracle.filters import _to_hybrid_filter
@@ -56,7 +56,7 @@ class OracleHybridRetriever:
             raise ValueError(f"search_mode must be one of {VALID_SEARCH_MODES}.")
 
         self.document_store = document_store
-        self.idx_name = _quote_indentifier(idx_name)
+        self.idx_name = _quote_identifier(idx_name)
         self.search_mode = search_mode
         self.filters = filters or {}
         self.top_k = top_k

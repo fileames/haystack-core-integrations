@@ -5,6 +5,7 @@ import json
 
 import oracledb
 import pytest
+from haystack.utils import Secret
 
 from haystack_integrations.components.embedders.oracle import OracleTextEmbedder
 from .conftest import (
@@ -26,6 +27,7 @@ class _FakeCursor:
     def __init__(self):
         self.rows = [(json.dumps({"embed_vector": json.dumps([0.1, 0.2])}),)]
         self.executed = []
+        self.raise_on_embedding = None
 
     def __enter__(self):
         return self
@@ -34,6 +36,8 @@ class _FakeCursor:
         return None
 
     def execute(self, query, params=None, **kwargs):
+        if self.raise_on_embedding and "utl_to_embeddings" in query:
+            raise self.raise_on_embedding
         self.query = query
         self.executed.append((query, params, kwargs))
 
@@ -86,8 +90,11 @@ class _AsyncFakeCursor:
     def __init__(self):
         self.rows = [(json.dumps({"embed_vector": json.dumps([0.1, 0.2])}),)]
         self.executed = []
+        self.raise_on_embedding = None
 
     async def execute(self, query, params=None, **kwargs):
+        if self.raise_on_embedding and "utl_to_embeddings" in query:
+            raise self.raise_on_embedding
         self.query = query
         self.executed.append((query, params, kwargs))
 
@@ -168,8 +175,56 @@ class TestOracleTextEmbedder:
         component_dict = embedder_component.to_dict()
         assert component_dict == {
             "type": "haystack_integrations.components.embedders.oracle.text_embedder.OracleTextEmbedder",
-            "init_parameters": {**default_params},
+            "init_parameters": {**default_params, "connection_params": {"user": None, "password": None, "dsn": None}},
         }
+
+    def test_to_dict_serializes_secret_connection_params_and_proxy(self):
+        embedder_component = OracleTextEmbedder(
+            **{
+                **default_params,
+                "connection_params": {
+                    "user": Secret.from_env_var("ORACLE_USER"),
+                    "password": Secret.from_env_var("ORACLE_PASSWORD"),
+                    "dsn": Secret.from_env_var("ORACLE_DSN"),
+                },
+                "proxy": Secret.from_env_var("ORACLE_PROXY"),
+            }
+        )
+
+        component_dict = embedder_component.to_dict()
+        assert component_dict["init_parameters"]["connection_params"] == {
+            "user": {"type": "env_var", "env_vars": ["ORACLE_USER"], "strict": True},
+            "password": {"type": "env_var", "env_vars": ["ORACLE_PASSWORD"], "strict": True},
+            "dsn": {"type": "env_var", "env_vars": ["ORACLE_DSN"], "strict": True},
+        }
+        assert component_dict["init_parameters"]["proxy"] == {
+            "type": "env_var",
+            "env_vars": ["ORACLE_PROXY"],
+            "strict": True,
+        }
+
+    def test_to_dict_omits_plain_sensitive_connection_params_and_proxy(self):
+        embedder_component = OracleTextEmbedder(
+            **{
+                **default_params,
+                "connection_params": {
+                    "user": "onnxuser",
+                    "password": "secret",
+                    "dsn": "onnxuser/secret@database.example/pdb",
+                    "events": True,
+                },
+                "proxy": "http://proxy_user:proxy_password@proxy.example:80",
+            }
+        )
+
+        component_dict = embedder_component.to_dict()
+        assert component_dict["init_parameters"]["connection_params"] == {
+            "user": None,
+            "password": None,
+            "dsn": None,
+            "events": True,
+        }
+        assert component_dict["init_parameters"]["proxy"] is None
 
     def test_from_dict(self):
         component_dict = {
@@ -178,6 +233,32 @@ class TestOracleTextEmbedder:
         }
 
         OracleTextEmbedder.from_dict(component_dict)
+
+    def test_from_dict_deserializes_secret_connection_params_and_proxy(self, monkeypatch):
+        monkeypatch.setenv("ORACLE_USER", "onnxuser")
+        monkeypatch.setenv("ORACLE_PASSWORD", "secret")
+        monkeypatch.setenv("ORACLE_DSN", "database.example/pdb")
+        monkeypatch.setenv("ORACLE_PROXY", "http://proxy")
+
+        embedder = OracleTextEmbedder.from_dict(
+            {
+                "type": "haystack_integrations.components.embedders.oracle.text_embedder.OracleTextEmbedder",
+                "init_parameters": {
+                    **default_params,
+                    "connection_params": {
+                        "user": {"type": "env_var", "env_vars": ["ORACLE_USER"], "strict": True},
+                        "password": {"type": "env_var", "env_vars": ["ORACLE_PASSWORD"], "strict": True},
+                        "dsn": {"type": "env_var", "env_vars": ["ORACLE_DSN"], "strict": True},
+                    },
+                    "proxy": {"type": "env_var", "env_vars": ["ORACLE_PROXY"], "strict": True},
+                },
+            }
+        )
+
+        assert embedder._connection_params["user"].resolve_value() == "onnxuser"
+        assert embedder._connection_params["password"].resolve_value() == "secret"
+        assert embedder._connection_params["dsn"].resolve_value() == "database.example/pdb"
+        assert embedder._proxy.resolve_value() == "http://proxy"
 
     def test_run_wrong_input_format(self):
         """
@@ -271,6 +352,36 @@ def test_ensure_initialized_uses_direct_connect_and_run(monkeypatch):
     assert embedder.run("hello") == {"embedding": [0.3, 0.4], "meta": default_params["embedding_params"]}
 
 
+def test_ensure_initialized_resolves_secret_connection_params(monkeypatch):
+    monkeypatch.setenv("ORACLE_USER", "onnxuser")
+    monkeypatch.setenv("ORACLE_PASSWORD", "secret")
+    monkeypatch.setenv("ORACLE_DSN", "database.example/pdb")
+    created = {}
+
+    def fake_connect(**kwargs):
+        created["connect"] = kwargs
+        return object()
+
+    monkeypatch.setattr(oracledb, "connect", fake_connect)
+    embedder = OracleTextEmbedder(
+        **{
+            **default_params,
+            "connection_params": {
+                "user": Secret.from_env_var("ORACLE_USER"),
+                "password": Secret.from_env_var("ORACLE_PASSWORD"),
+                "dsn": Secret.from_env_var("ORACLE_DSN"),
+            },
+        }
+    )
+    embedder._ensure_initialized()
+
+    assert created["connect"] == {
+        "user": "onnxuser",
+        "password": "secret",
+        "dsn": "database.example/pdb",
+    }
+
+
 def test_embed_documents_sync_proxy_and_empty_row(monkeypatch):
     released = {"value": False}
     connection = _FakeConnection()
@@ -284,7 +395,34 @@ def test_embed_documents_sync_proxy_and_empty_row(monkeypatch):
     embedder._initialized = True
 
     assert embedder._embed_documents(["hello"]) == [[]]
-    assert connection.cursor_obj.executed[0][0] == "begin utl_http.set_proxy(:proxy); end;"
+    assert [
+        kwargs.get("proxy")
+        for query, _params, kwargs in connection.cursor_obj.executed
+        if query == "begin utl_http.set_proxy(:proxy); end;"
+    ] == ["http://proxy", None]
+
+
+def test_embed_documents_sync_proxy_cleared_on_exception(monkeypatch):
+    released = {"value": False}
+    connection = _FakeConnection()
+    connection.cursor_obj.raise_on_embedding = RuntimeError("embedding failed")
+    pool = _FakePool(connection, released)
+
+    monkeypatch.setattr(oracledb, "ConnectionPool", _FakePool, raising=False)
+
+    embedder = OracleTextEmbedder(**{**default_params, "use_connection_pool": True, "proxy": "http://proxy"})
+    embedder._client = pool
+    embedder._initialized = True
+
+    with pytest.raises(RuntimeError, match="embedding failed"):
+        embedder._embed_documents(["hello"])
+
+    assert [
+        kwargs.get("proxy")
+        for query, _params, kwargs in connection.cursor_obj.executed
+        if query == "begin utl_http.set_proxy(:proxy); end;"
+    ] == ["http://proxy", None]
+    assert released["value"] is True
 
 
 @pytest.mark.asyncio
@@ -362,7 +500,35 @@ async def test_embed_documents_async_proxy_and_empty_row(monkeypatch):
     embedder._initialized_async = True
 
     assert await embedder._embed_documents_async(["hello"]) == [[]]
-    assert connection.cursor_obj.executed[0][0] == "begin utl_http.set_proxy(:proxy); end;"
+    assert [
+        kwargs.get("proxy")
+        for query, _params, kwargs in connection.cursor_obj.executed
+        if query == "begin utl_http.set_proxy(:proxy); end;"
+    ] == ["http://proxy", None]
+
+
+@pytest.mark.asyncio
+async def test_embed_documents_async_proxy_cleared_on_exception(monkeypatch):
+    released = {"value": False}
+    connection = _AsyncFakeConnection()
+    connection.cursor_obj.raise_on_embedding = RuntimeError("embedding failed")
+    pool = _AsyncFakePool(connection, released)
+
+    monkeypatch.setattr(oracledb, "AsyncConnectionPool", _AsyncFakePool, raising=False)
+
+    embedder = OracleTextEmbedder(**{**default_params, "use_connection_pool": True, "proxy": "http://proxy"})
+    embedder._client_async = pool
+    embedder._initialized_async = True
+
+    with pytest.raises(RuntimeError, match="embedding failed"):
+        await embedder._embed_documents_async(["hello"])
+
+    assert [
+        kwargs.get("proxy")
+        for query, _params, kwargs in connection.cursor_obj.executed
+        if query == "begin utl_http.set_proxy(:proxy); end;"
+    ] == ["http://proxy", None]
+    assert released["value"] is True
 
 
 @pytest.mark.asyncio

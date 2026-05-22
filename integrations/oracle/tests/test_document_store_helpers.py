@@ -373,10 +373,10 @@ async def test_table_exists_async_false_and_reraise(monkeypatch):
 
 
 def test_identifier_and_index_query_helpers():
-    assert ds._quote_indentifier("docs") == '"docs"'
-    assert ds._quote_indentifier('schema."docs"') == '"schema"."docs"'
+    assert ds._quote_identifier("docs") == '"docs"'
+    assert ds._quote_identifier('schema."docs"') == '"schema"."docs"'
     with pytest.raises(ValueError, match="not valid"):
-        ds._quote_indentifier('schema."docs')
+        ds._quote_identifier('schema."docs')
 
     query, params = ds._get_index_exists_query('"IDX"', '"TAB"')
     assert "table_name" in query
@@ -461,26 +461,55 @@ def test_index_ddl_builders():
     idx_name, ddl = ds._get_hnsw_index_ddl("docs", "cosine")
     assert idx_name.startswith('"HNSW_')
     assert "DISTANCE cosine" in ddl
-    assert "efConstruction 200" in ddl
+    assert "efconstruction 200" in ddl
 
     _, ddl = ds._get_hnsw_index_ddl("docs", "dot", {"idx_type": "HNSW", "neighbors": 10})
     assert "neighbors 10" in ddl
-    assert "efConstruction 200" in ddl
+    assert "efconstruction 200" in ddl
 
-    _, ddl = ds._get_hnsw_index_ddl("docs", "dot", {"idx_type": "HNSW", "efConstruction": 10})
+    _, ddl = ds._get_hnsw_index_ddl("docs", "dot", {"idx_type": "HNSW", "efconstruction": 10})
     assert "neighbors 32" in ddl
-    assert "efConstruction 10" in ddl
+    assert "efconstruction 10" in ddl
 
     with pytest.raises(ValueError, match="Invalid parameter"):
         ds._get_hnsw_index_ddl("docs", "dot", {"idx_type": "HNSW", "bogus": 1})
+
+    with pytest.raises(ValueError, match="Invalid parameter"):
+        ds._get_hnsw_index_ddl("docs", "dot", {"idx_type": "HNSW", "efConstruction": 10})
+
+    with pytest.raises(ValueError, match="parallel must be an integer"):
+        ds._get_hnsw_index_ddl("docs", "dot", {"idx_type": "HNSW", "parallel": "8 NOLOGGING"})
+
+    with pytest.raises(ValueError, match="accuracy must be at most 100"):
+        ds._get_hnsw_index_ddl("docs", "dot", {"idx_type": "HNSW", "accuracy": 101})
 
     idx_name, ddl = ds._get_ivf_index_ddl("docs", "euclidean")
     assert idx_name.startswith('"IVF_')
     assert "DISTANCE euclidean" in ddl
     assert "neighbor partitions 32" in ddl
 
+    _, ddl = ds._get_ivf_index_ddl(
+        "docs",
+        "euclidean",
+        {
+            "idx_type": "IVF",
+            "neighbor_partitions": 64,
+            "samples_per_partition": 8,
+            "min_vectors_per_partition": 2,
+        },
+    )
+    assert "neighbor partitions 64" in ddl
+    assert "samples_per_partition 8" in ddl
+    assert "min_vectors_per_partition 2" in ddl
+
     with pytest.raises(ValueError, match="Invalid parameter"):
         ds._get_ivf_index_ddl("docs", "dot", {"idx_type": "IVF", "bogus": 1})
+
+    with pytest.raises(ValueError, match="Invalid parameter"):
+        ds._get_ivf_index_ddl("docs", "dot", {"idx_type": "IVF", "neighbor_part": 32})
+
+    with pytest.raises(ValueError, match="parallel must be an integer"):
+        ds._get_ivf_index_ddl("docs", "dot", {"idx_type": "IVF", "parallel": "8 NOLOGGING"})
 
 
 def test_create_index_helpers(monkeypatch):
@@ -524,9 +553,7 @@ async def test_create_index_helpers_async(monkeypatch):
     assert cursor.executed
 
     cursor = _AsyncExecCursor()
-    await ds._create_ivf_index_async(
-        _AsyncConnection(cursor), "docs", "dot", {"idx_type": "IVF", "idx_name": '"IDX"'}
-    )
+    await ds._create_ivf_index_async(_AsyncConnection(cursor), "docs", "dot", {"idx_type": "IVF", "idx_name": '"IDX"'})
     assert cursor.executed
 
     async def fake_index_exists_async_true(*args, **kwargs):
@@ -540,9 +567,7 @@ async def test_create_index_helpers_async(monkeypatch):
     assert cursor.executed == []
 
     cursor = _AsyncExecCursor()
-    await ds._create_ivf_index_async(
-        _AsyncConnection(cursor), "docs", "dot", {"idx_type": "IVF", "idx_name": '"IDX"'}
-    )
+    await ds._create_ivf_index_async(_AsyncConnection(cursor), "docs", "dot", {"idx_type": "IVF", "idx_name": '"IDX"'})
     assert cursor.executed == []
 
 
@@ -594,7 +619,20 @@ def test_document_store_internal_helpers(monkeypatch):
 
     dense_cursor = _ExecCursor(
         fetchall_result=[("1", "hello", None, None, None, {"topic": "x"}, None, [0.1], None)],
-        description=[SimpleNamespace(name=name) for name in ("ID", "CONTENT", "BLOB_DATA", "BLOB_META", "BLOB_MIME_TYPE", "META", "SCORE", "EMBEDDING", "SPARSE_EMBEDDING")],
+        description=[
+            SimpleNamespace(name=name)
+            for name in (
+                "ID",
+                "CONTENT",
+                "BLOB_DATA",
+                "BLOB_META",
+                "BLOB_MIME_TYPE",
+                "META",
+                "SCORE",
+                "EMBEDDING",
+                "SPARSE_EMBEDDING",
+            )
+        ],
     )
 
     @contextmanager
@@ -602,7 +640,9 @@ def test_document_store_internal_helpers(monkeypatch):
         yield _Connection(dense_cursor)
 
     monkeypatch.setattr(ds, "_get_connection", dense_connection)
-    monkeypatch.setattr(ds, "_get_filter_string", lambda filters, metadata_column, bind_variables: bind_variables.append("x") or "COND")
+    monkeypatch.setattr(
+        ds, "_get_filter_string", lambda filters, metadata_column, bind_variables: bind_variables.append("x") or "COND"
+    )
     store._initialized = True
     store._client = object()
     docs = store._embedding_retrieval([0.1, 0.2], filters={"field": "meta.topic", "operator": "==", "value": "x"})
@@ -632,7 +672,20 @@ async def test_document_store_async_internal_helpers(monkeypatch):
 
     cursor = _AsyncExecCursor(
         fetchall_result=[("1", "hello", None, None, None, {"topic": "x"}, None, [0.1], _SparseValue([1], [0.5]))],
-        description=[SimpleNamespace(name=name) for name in ("ID", "CONTENT", "BLOB_DATA", "BLOB_META", "BLOB_MIME_TYPE", "META", "SCORE", "EMBEDDING", "SPARSE_EMBEDDING")],
+        description=[
+            SimpleNamespace(name=name)
+            for name in (
+                "ID",
+                "CONTENT",
+                "BLOB_DATA",
+                "BLOB_META",
+                "BLOB_MIME_TYPE",
+                "META",
+                "SCORE",
+                "EMBEDDING",
+                "SPARSE_EMBEDDING",
+            )
+        ],
     )
 
     @asynccontextmanager
@@ -640,7 +693,9 @@ async def test_document_store_async_internal_helpers(monkeypatch):
         yield _AsyncConnection(cursor)
 
     monkeypatch.setattr(ds, "_get_connection_async", async_connection)
-    monkeypatch.setattr(ds, "_get_filter_string", lambda filters, metadata_column, bind_variables: bind_variables.append("x") or "COND")
+    monkeypatch.setattr(
+        ds, "_get_filter_string", lambda filters, metadata_column, bind_variables: bind_variables.append("x") or "COND"
+    )
     store._initialized_async = True
     store._client_async = object()
 
@@ -699,7 +754,9 @@ def test_filter_write_and_delete_sync_helpers(monkeypatch):
         yield connection
 
     monkeypatch.setattr(ds, "_get_connection", get_connection)
-    monkeypatch.setattr(ds, "_get_filter_string", lambda _filters, _meta, bind_variables: bind_variables.append("x") or "COND")
+    monkeypatch.setattr(
+        ds, "_get_filter_string", lambda _filters, _meta, bind_variables: bind_variables.append("x") or "COND"
+    )
 
     docs = store.filter_documents({"field": "meta.topic", "operator": "==", "value": "x"})
     assert docs[0].id == "1"
@@ -788,7 +845,9 @@ async def test_filter_write_and_delete_async_helpers(monkeypatch):
         return await callback(connection)
 
     monkeypatch.setattr(store, "_handle_context", handle_context)
-    monkeypatch.setattr(ds, "_get_filter_string", lambda _filters, _meta, bind_variables: bind_variables.append("x") or "COND")
+    monkeypatch.setattr(
+        ds, "_get_filter_string", lambda _filters, _meta, bind_variables: bind_variables.append("x") or "COND"
+    )
 
     docs = await store.filter_documents_async({"field": "meta.topic", "operator": "==", "value": "x"})
     assert docs[0].id == "1"
@@ -929,14 +988,20 @@ def test_vectorizer_preference_parameter_helpers():
         external_embedder,
         {"embedder_spec": {"provider": "openai", "model": "text-embedding-3-small"}},
     ) == {"embedder_spec": {"provider": "openai", "model": "text-embedding-3-small"}}
-    assert ds._validate_vectorizer_parameters(
-        {"provider": "database", "model": "ALL_MINILM_L12_V2"},
-        {"model": "ALL_MINILM_L12_V2"},
-    ) is True
-    assert ds._validate_vectorizer_parameters(
-        {"provider": "openai", "model": "text-embedding-3-small"},
-        {"embedder_spec": {"provider": "openai", "model": "text-embedding-3-small"}},
-    ) is True
+    assert (
+        ds._validate_vectorizer_parameters(
+            {"provider": "database", "model": "ALL_MINILM_L12_V2"},
+            {"model": "ALL_MINILM_L12_V2"},
+        )
+        is True
+    )
+    assert (
+        ds._validate_vectorizer_parameters(
+            {"provider": "openai", "model": "text-embedding-3-small"},
+            {"embedder_spec": {"provider": "openai", "model": "text-embedding-3-small"}},
+        )
+        is True
+    )
 
     with pytest.raises(ValueError, match="Mismatch between text_embedder"):
         ds._get_vectorizer_preference_parameters(text_embedder, {"model": "OTHER"})
@@ -973,15 +1038,39 @@ def test_hybrid_index_ddl_builder():
         },
     )
     assert "word_min_len 2" in ddl
-    assert "FILTER BY id,meta" in ddl
-    assert "ORDER BY id DESC" in ddl
+    assert 'FILTER BY "ID","META"' in ddl
+    assert 'ORDER BY "ID" DESC' in ddl
     assert "PARALLEL 4" in ddl
+
+    ddl = ds._get_hybrid_index_ddl(
+        store._table_name,
+        '"IDX"',
+        preference,
+        {
+            "filter_by": ['"id"', "schema.meta", '"Mixed"."CaseCol"'],
+            "order_by": ['"ts"'],
+        },
+    )
+    assert 'FILTER BY "id","SCHEMA"."META","Mixed"."CaseCol"' in ddl
+    assert 'ORDER BY "ts" ASC' in ddl
 
     with pytest.raises(ValueError, match="Vectorization parameters must be given"):
         ds._get_hybrid_index_ddl(store._table_name, '"IDX"', preference, {"parameters": {"vectorizer": "PREF_Y"}})
 
-    with pytest.raises(ValueError, match="parallel must be int"):
+    with pytest.raises(ValueError, match="parallel must be a positive integer"):
         ds._get_hybrid_index_ddl(store._table_name, '"IDX"', preference, {"parallel": "4"})
+
+    with pytest.raises(ValueError, match="filter_by contains an invalid identifier"):
+        ds._get_hybrid_index_ddl(store._table_name, '"IDX"', preference, {"filter_by": ["id DESC"]})
+
+    with pytest.raises(ValueError, match="order_by contains an invalid identifier"):
+        ds._get_hybrid_index_ddl(store._table_name, '"IDX"', preference, {"order_by": ['id"']})
+
+    with pytest.raises(ValueError, match="order_by_asc must be a boolean"):
+        ds._get_hybrid_index_ddl(store._table_name, '"IDX"', preference, {"order_by_asc": "false"})
+
+    with pytest.raises(ValueError, match="parallel must be a positive integer"):
+        ds._get_hybrid_index_ddl(store._table_name, '"IDX"', preference, {"parallel": 0})
 
 
 def test_vectorizer_preference_create_drop_and_hybrid_index(monkeypatch):
@@ -1486,7 +1575,9 @@ def test_document_store_init_validation_and_sync_initialization(monkeypatch):
     created = {"index": 0, "sparse": 0}
     monkeypatch.setattr(ds.oracledb, "create_pool", lambda **kwargs: object())
     monkeypatch.setattr(ds, "_table_exists", lambda *args, **kwargs: True)
-    monkeypatch.setattr(store, "_create_index", lambda *args, **kwargs: created.__setitem__("index", created["index"] + 1))
+    monkeypatch.setattr(
+        store, "_create_index", lambda *args, **kwargs: created.__setitem__("index", created["index"] + 1)
+    )
     monkeypatch.setattr(
         store,
         "_create_sparse_index",

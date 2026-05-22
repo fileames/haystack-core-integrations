@@ -2,17 +2,26 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 import json
+import logging
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any
 
 import oracledb
 from haystack import component, default_from_dict, default_to_dict
 
 from haystack_integrations.components.document_stores.oracle.document_store import (
     _compare_version,
+    _deserialize_connection_params,
+    _deserialize_optional_secret,
     _get_connection,
     _get_connection_async,
+    _resolve_connection_params,
+    _resolve_optional_secret,
+    _serialize_connection_params,
+    _serialize_optional_secret,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @component
@@ -30,19 +39,21 @@ class OracleTextEmbedder:
         embedding_params: dict[str, Any],
         *,
         use_connection_pool: bool = False,
-        proxy: Optional[str],
+        proxy: Any | None,
     ):
         """
         Creates a new OracleTextEmbedder component.
 
         :param connection_params: Connection parameters for python-oracledb. Required.
             See the python-oracledb docs (https://python-oracledb.readthedocs.io/en/latest/user_guide/connection_handling.html).
+            Values can be Haystack `Secret` instances to avoid serializing raw credentials.
         :param embedding_params: Embedding parameters passed to Oracle embeddings (for example, provider, model, etc.).
             See the Oracle embedding docs (https://docs.oracle.com/en/database/oracle/oracle-database/26/vecse/utl_to_embedding-and-utl_to_embeddings-dbms_vector.html)
             for accepted values.
         :param use_connection_pool: If True, use a python-oracledb connection pool for connections. Defaults to False.
         :param proxy: Optional HTTP proxy to set via UTL_HTTP.set_proxy for outbound calls in the database session.
-        """  # noqa: E501
+            Can be a Haystack `Secret` to avoid serializing proxy credentials.
+        """
 
         self._connection_params = connection_params
         self._embedding_params = embedding_params
@@ -64,6 +75,11 @@ class OracleTextEmbedder:
         :returns:
             Deserialized component.
         """
+        init_params = data.get("init_parameters", {})
+        connection_params = init_params.get("connection_params")
+        if isinstance(connection_params, dict):
+            _deserialize_connection_params(connection_params)
+        _deserialize_optional_secret(init_params, "proxy")
         return default_from_dict(cls, data)
 
     def to_dict(self) -> dict[str, Any]:
@@ -75,11 +91,17 @@ class OracleTextEmbedder:
         """
         return default_to_dict(
             self,
-            connection_params=self._connection_params,
+            connection_params=self._serialized_connection_params(),
             embedding_params=self._embedding_params,
             use_connection_pool=self._use_connection_pool,
-            proxy=self._proxy,
+            proxy=self._serialized_proxy(),
         )
+
+    def _serialized_connection_params(self) -> dict[str, Any]:
+        return _serialize_connection_params(self._connection_params)
+
+    def _serialized_proxy(self) -> dict[str, Any] | None:
+        return _serialize_optional_secret(self._proxy)
 
     def _ensure_initialized(self):
         """
@@ -98,10 +120,11 @@ class OracleTextEmbedder:
                 must be >=2.2.0 for vector support"
             )
 
+        resolved_connection_params = _resolve_connection_params(self._connection_params)
         if self._use_connection_pool:
-            self._client = oracledb.create_pool(**self._connection_params)
+            self._client = oracledb.create_pool(**resolved_connection_params)
         else:
-            self._client = oracledb.connect(**self._connection_params)
+            self._client = oracledb.connect(**resolved_connection_params)
 
         self._initialized = True
 
@@ -122,10 +145,11 @@ class OracleTextEmbedder:
                 must be >=2.2.0 for vector support"
             )
 
+        resolved_connection_params = _resolve_connection_params(self._connection_params)
         if self._use_connection_pool:
-            self._client_async = await oracledb.create_pool_async(**self._connection_params)
+            self._client_async = await oracledb.create_pool_async(**resolved_connection_params)
         else:
-            self._client_async = await oracledb.connect_async(**self._connection_params)
+            self._client_async = await oracledb.connect_async(**resolved_connection_params)
 
         self._initialized_async = True
 
@@ -165,30 +189,50 @@ class OracleTextEmbedder:
 
         with _get_connection(self._client) as connection:
             with connection.cursor() as cursor:
-                if self._proxy:
-                    cursor.execute("begin utl_http.set_proxy(:proxy); end;", proxy=self._proxy)
+                proxy_was_set = False
+                proxy = _resolve_optional_secret(self._proxy)
+                if proxy:
+                    cursor.execute("begin utl_http.set_proxy(:proxy); end;", proxy=proxy)
+                    proxy_was_set = True
 
-                chunks = []
-                for i, text in enumerate(texts, start=1):
-                    chunk = {"chunk_id": i, "chunk_data": text}
-                    chunks.append(json.dumps(chunk))
+                try:
+                    chunks = []
+                    for i, text in enumerate(texts, start=1):
+                        chunk = {"chunk_id": i, "chunk_data": text}
+                        chunks.append(json.dumps(chunk))
 
-                vector_array_type = connection.gettype("SYS.VECTOR_ARRAY_T")
-                inputs = vector_array_type.newobject(chunks)
-                cursor.setinputsizes(None, oracledb.DB_TYPE_JSON)
-                cursor.execute(
-                    "select t.* from dbms_vector_chain.utl_to_embeddings(:1, json(:2)) t",
-                    [inputs, self._embedding_params],
-                )
+                    vector_array_type = connection.gettype("SYS.VECTOR_ARRAY_T")
+                    inputs = vector_array_type.newobject(chunks)
+                    cursor.setinputsizes(None, oracledb.DB_TYPE_JSON)
+                    cursor.execute(
+                        "select t.* from dbms_vector_chain.utl_to_embeddings(:1, json(:2)) t",
+                        [inputs, self._embedding_params],
+                    )
 
-                for row in cursor:
-                    if row is None:
-                        embeddings.append([])
-                    else:
-                        rdata = json.loads(row[0])
-                        # dereference string as array
-                        vec = json.loads(rdata["embed_vector"])
-                        embeddings.append(vec)
+                    for row in cursor:
+                        if row is None:
+                            embeddings.append([])
+                        else:
+                            rdata = json.loads(row[0])
+                            # dereference string as array
+                            vec = json.loads(rdata["embed_vector"])
+                            embeddings.append(vec)
+                except BaseException:
+                    if proxy_was_set:
+                        try:
+                            cursor.execute("begin utl_http.set_proxy(:proxy); end;", proxy=None)
+                        except Exception:
+                            logger.exception("Failed to clear Oracle session proxy after embedding failed")
+                    raise
+                else:
+                    if proxy_was_set:
+                        try:
+                            cursor.execute("begin utl_http.set_proxy(:proxy); end;", proxy=None)
+                        except Exception:
+                            logger.warning(
+                                "Failed to clear Oracle session proxy after embedding succeeded",
+                                exc_info=True,
+                            )
 
         return embeddings
 
@@ -208,37 +252,57 @@ class OracleTextEmbedder:
             oracledb.defaults.fetch_lobs = False
 
             with connection.cursor() as cursor:
-                if self._proxy:
-                    await cursor.execute("begin utl_http.set_proxy(:proxy); end;", proxy=self._proxy)
+                proxy_was_set = False
+                proxy = _resolve_optional_secret(self._proxy)
+                if proxy:
+                    await cursor.execute("begin utl_http.set_proxy(:proxy); end;", proxy=proxy)
+                    proxy_was_set = True
 
-                chunks = []
-                for i, text in enumerate(texts, start=1):
-                    chunk = {"chunk_id": i, "chunk_data": text}
-                    chunks.append(json.dumps(chunk))
+                try:
+                    chunks = []
+                    for i, text in enumerate(texts, start=1):
+                        chunk = {"chunk_id": i, "chunk_data": text}
+                        chunks.append(json.dumps(chunk))
 
-                vector_array_type = await connection.gettype("SYS.VECTOR_ARRAY_T")
-                inputs = vector_array_type.newobject()
-                for v in chunks:
-                    clob = await connection.createlob(oracledb.DB_TYPE_CLOB) 
-                    await clob.write(v) 
-                    inputs.append(clob) 
+                    vector_array_type = await connection.gettype("SYS.VECTOR_ARRAY_T")
+                    inputs = vector_array_type.newobject()
+                    for v in chunks:
+                        clob = await connection.createlob(oracledb.DB_TYPE_CLOB)
+                        await clob.write(v)
+                        inputs.append(clob)
 
-                cursor.setinputsizes(None, oracledb.DB_TYPE_JSON)
-                await cursor.execute(
-                    "select t.* from dbms_vector_chain.utl_to_embeddings(:1, json(:2)) t",
-                    [inputs, self._embedding_params],
-                )
+                    cursor.setinputsizes(None, oracledb.DB_TYPE_JSON)
+                    await cursor.execute(
+                        "select t.* from dbms_vector_chain.utl_to_embeddings(:1, json(:2)) t",
+                        [inputs, self._embedding_params],
+                    )
 
-                for row in await cursor.fetchall():
-                    if row is None:
-                        embeddings.append([])
-                    else:
-                        rdata = json.loads(row[0])
-                        # dereference string as array
-                        vec = json.loads(rdata["embed_vector"])
-                        embeddings.append(vec)
+                    for row in await cursor.fetchall():
+                        if row is None:
+                            embeddings.append([])
+                        else:
+                            rdata = json.loads(row[0])
+                            # dereference string as array
+                            vec = json.loads(rdata["embed_vector"])
+                            embeddings.append(vec)
+                except BaseException:
+                    if proxy_was_set:
+                        try:
+                            await cursor.execute("begin utl_http.set_proxy(:proxy); end;", proxy=None)
+                        except Exception:
+                            logger.exception("Failed to clear Oracle session proxy after embedding failed")
+                    raise
+                else:
+                    if proxy_was_set:
+                        try:
+                            await cursor.execute("begin utl_http.set_proxy(:proxy); end;", proxy=None)
+                        except Exception:
+                            logger.warning(
+                                "Failed to clear Oracle session proxy after embedding succeeded",
+                                exc_info=True,
+                            )
 
-            return embeddings
+                return embeddings
 
         return await self._handle_context(context)
 

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from haystack import Document
+from haystack.utils import Secret
 
 from haystack_integrations.components.embedders.oracle import OracleDocumentEmbedder
 from .conftest import (
@@ -40,7 +41,32 @@ class TestOracleTextEmbedder:
         component_dict = embedder_component.to_dict()
         assert component_dict == {
             "type": "haystack_integrations.components.embedders.oracle.document_embedder.OracleDocumentEmbedder",
-            "init_parameters": {**default_params},
+            "init_parameters": {**default_params, "connection_params": {"user": None, "password": None, "dsn": None}},
+        }
+
+    def test_to_dict_serializes_secret_connection_params_and_proxy(self):
+        embedder_component = OracleDocumentEmbedder(
+            **{
+                **default_params,
+                "connection_params": {
+                    "user": Secret.from_env_var("ORACLE_USER"),
+                    "password": Secret.from_env_var("ORACLE_PASSWORD"),
+                    "dsn": Secret.from_env_var("ORACLE_DSN"),
+                },
+                "proxy": Secret.from_env_var("ORACLE_PROXY"),
+            }
+        )
+
+        component_dict = embedder_component.to_dict()
+        assert component_dict["init_parameters"]["connection_params"] == {
+            "user": {"type": "env_var", "env_vars": ["ORACLE_USER"], "strict": True},
+            "password": {"type": "env_var", "env_vars": ["ORACLE_PASSWORD"], "strict": True},
+            "dsn": {"type": "env_var", "env_vars": ["ORACLE_DSN"], "strict": True},
+        }
+        assert component_dict["init_parameters"]["proxy"] == {
+            "type": "env_var",
+            "env_vars": ["ORACLE_PROXY"],
+            "strict": True,
         }
 
     def test_from_dict(self):

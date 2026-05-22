@@ -8,7 +8,8 @@ for lists of Haystack Documents using Oracle Database vector capabilities. It ex
 OracleTextEmbedder by handling Document objects, optional inclusion of selected metadata fields,
 and synchronous/asynchronous execution.
 """
-from typing import Any, Optional
+
+from typing import Any
 
 from haystack import Document, component, default_to_dict
 
@@ -24,13 +25,14 @@ class OracleDocumentEmbedder(OracleTextEmbedder):
     requests embeddings from Oracle Database. The resulting vectors are assigned back
     to the corresponding Document.embedding fields.
     """
+
     def __init__(
         self,
         connection_params: dict[str, Any],
         embedding_params: dict[str, Any],
         *,
         use_connection_pool: bool = False,
-        proxy: Optional[str],
+        proxy: Any | None,
         meta_fields_to_embed: list[str] = [],
         embedding_separator: str = "\n",
     ):
@@ -150,10 +152,10 @@ class OracleDocumentEmbedder(OracleTextEmbedder):
         """
         return default_to_dict(
             self,
-            connection_params=self._connection_params,
+            connection_params=self._serialized_connection_params(),
             embedding_params=self._embedding_params,
             use_connection_pool=self._use_connection_pool,
-            proxy=self._proxy,
+            proxy=self._serialized_proxy(),
             meta_fields_to_embed=self._meta_fields_to_embed,
             embedding_separator=self._embedding_separator,
         )

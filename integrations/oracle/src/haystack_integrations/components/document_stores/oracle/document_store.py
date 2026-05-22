@@ -15,6 +15,7 @@ from haystack.dataclasses import Document, SparseEmbedding
 from haystack.document_stores.errors import DuplicateDocumentError
 from haystack.document_stores.types import DuplicatePolicy
 from haystack.errors import FilterError
+from haystack.utils import Secret, deserialize_secrets_inplace
 
 from .filters import _get_filter_string
 
@@ -27,6 +28,20 @@ DistanceStrategy = Literal["dot", "euclidean", "cosine"]
 EmbeddingField = Literal["embedding", "sparse_embedding"]
 
 VALID_DISTANCE_FUNCTIONS: tuple[DistanceStrategy, ...] = ("dot", "euclidean", "cosine")
+_PASSWORD_IN_CONNECT_STRING = re.compile(r"^\S+/\S+@\S+$")
+_PASSWORD_IN_URL = re.compile(r"://[^/@\s:]+:[^/@\s]+@")
+_SENSITIVE_CONNECTION_KEY_PARTS = (
+    "user",
+    "username",
+    "password",
+    "passwd",
+    "pwd",
+    "dsn",
+    "secret",
+    "token",
+    "key",
+    "credential",
+)
 
 # define a type variable that can be any kind of function
 T = TypeVar("T", bound=Callable[..., Any])
@@ -262,7 +277,7 @@ def _get_delete_ddl(table_name: str, ids: Optional[list[str]]) -> tuple[str, dic
     return ddl, bind_vars
 
 
-def _quote_indentifier(name: str) -> str:
+def _quote_identifier(name: str) -> str:
     name = name.strip()
     reg = r'^(?:"[^"]+"|[^".]+)(?:\.(?:"[^"]+"|[^".]+))*$'
     pattern_validate = re.compile(reg)
@@ -276,6 +291,119 @@ def _quote_indentifier(name: str) -> str:
     groups = [f'"{g}"' for g in groups]
 
     return ".".join(groups)
+
+
+def _validate_int_param(
+    config: dict[str, Any],
+    key: str,
+    min_value: int,
+    max_value: int | None = None,
+) -> None:
+    if key not in config:
+        return
+
+    value = config[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key} must be an integer.")
+    if value < min_value:
+        raise ValueError(f"{key} must be at least {min_value}.")
+    if max_value is not None and value > max_value:
+        raise ValueError(f"{key} must be at most {max_value}.")
+
+
+def _validate_allowed_params(config: dict[str, Any], allowed_keys: set[str]) -> None:
+    for key in config:
+        if key not in allowed_keys:
+            raise ValueError(f"Invalid parameter: {key}")
+
+
+def _validate_index_type(config: dict[str, Any], expected_type: str) -> None:
+    if "idx_type" not in config:
+        return
+
+    idx_type = config["idx_type"]
+    if not isinstance(idx_type, str) or idx_type.upper() != expected_type:
+        raise ValueError(f"idx_type must be {expected_type}.")
+    config["idx_type"] = expected_type
+
+
+def _quote_hybrid_identifier(value: str, field_name: str) -> str:
+    value = value.strip()
+    simple_identifier = r"[A-Za-z][A-Za-z0-9_$#]*"
+    reg = rf'^(?:"{simple_identifier}"|{simple_identifier})(?:\.(?:"{simple_identifier}"|{simple_identifier}))*$'
+    if not re.fullmatch(reg, value):
+        raise ValueError(f"{field_name} contains an invalid identifier.")
+
+    pattern_match = rf'"({simple_identifier})"|({simple_identifier})'
+    groups = re.findall(pattern_match, value)
+    quoted_groups = [f'"{quoted}"' if quoted else f'"{unquoted.upper()}"' for quoted, unquoted in groups]
+    return ".".join(quoted_groups)
+
+
+def _quote_hybrid_identifier_list(values: Any, field_name: str) -> str:
+    if not isinstance(values, (list, tuple)):
+        raise ValueError(f"{field_name} must be a list of column names.")
+    if not all(isinstance(value, str) for value in values):
+        raise ValueError(f"{field_name} must contain only column names.")
+    return ",".join(_quote_hybrid_identifier(value, field_name) for value in values)
+
+
+def _is_sensitive_connection_key(key: str) -> bool:
+    key_lower = key.lower()
+    return any(part in key_lower for part in _SENSITIVE_CONNECTION_KEY_PARTS)
+
+
+def _is_sensitive_connection_string(value: str) -> bool:
+    return bool(_PASSWORD_IN_CONNECT_STRING.fullmatch(value) or _PASSWORD_IN_URL.search(value))
+
+
+def _serialize_connection_param(key: str, value: Any) -> Any:
+    if isinstance(value, Secret):
+        return value.to_dict()
+    if isinstance(value, str) and (_is_sensitive_connection_key(key) or _is_sensitive_connection_string(value)):
+        return None
+    return value
+
+
+def _serialize_connection_params(connection_params: dict[str, Any]) -> dict[str, Any]:
+    return {key: _serialize_connection_param(key, value) for key, value in connection_params.items()}
+
+
+def _deserialize_connection_params(connection_params: dict[str, Any]) -> None:
+    secret_keys = [
+        key
+        for key, value in connection_params.items()
+        if isinstance(value, dict) and value.get("type") in {"env_var", "token"}
+    ]
+    if secret_keys:
+        deserialize_secrets_inplace(connection_params, keys=secret_keys)
+
+
+def _resolve_connection_params(connection_params: dict[str, Any]) -> dict[str, Any]:
+    resolved: dict[str, Any] = {}
+    for key, value in connection_params.items():
+        if isinstance(value, Secret):
+            resolved[key] = value.resolve_value()
+        else:
+            resolved[key] = value
+    return resolved
+
+
+def _serialize_optional_secret(value: Secret | str | None) -> dict[str, Any] | None:
+    if isinstance(value, Secret):
+        return value.to_dict()
+    return None
+
+
+def _deserialize_optional_secret(data: dict[str, Any], key: str) -> None:
+    if isinstance(data.get(key), dict) and data[key].get("type") in {"env_var", "token"}:
+        deserialize_secrets_inplace(data, keys=[key])
+
+
+def _resolve_optional_secret(value: Secret | str | None) -> str | None:
+    if isinstance(value, Secret):
+        return value.resolve_value()
+    return value
 
 
 def _validate_text_index_column(column_name: str) -> str:
@@ -382,12 +510,14 @@ def _get_hnsw_index_ddl(
         "idx_name": "HNSW",
         "idx_type": "HNSW",
         "neighbors": 32,
-        "efConstruction": 200,
+        "efconstruction": 200,
         "accuracy": 90,
         "parallel": 8,
     }
 
-    if params:
+    if params is not None:
+        if not isinstance(params, dict):
+            raise ValueError("params must be a dictionary.")
         config = params.copy()
         # ensure compulsory parts are included
         for compulsory_key in ["idx_name", "parallel"]:
@@ -397,15 +527,21 @@ def _get_hnsw_index_ddl(
                 else:
                     config[compulsory_key] = defaults[compulsory_key]
 
-        # validate keys in config against defaults
-        for key in config:
-            if key not in defaults:
-                raise ValueError(f"Invalid parameter: {key}")
+        _validate_allowed_params(config, set(defaults))
     else:
-        config = defaults
+        config = defaults.copy()
         config["idx_name"] = _get_index_name(str(config["idx_name"]))
 
+    if ("neighbors" in config or "efconstruction" in config) and "idx_type" not in config:
+        config["idx_type"] = defaults["idx_type"]
+    _validate_index_type(config, "HNSW")
+    _validate_int_param(config, "accuracy", 1, 100)
+    _validate_int_param(config, "neighbors", 2, 2048)
+    _validate_int_param(config, "efconstruction", 1, 65535)
+    _validate_int_param(config, "parallel", 1)
+
     # base SQL statement
+    config["idx_name"] = _quote_identifier(config["idx_name"])
     idx_name = config["idx_name"]
     base_sql = (
         f"create vector index {idx_name} on {table_name}({embedding_column}) ORGANIZATION INMEMORY NEIGHBOR GRAPH"
@@ -416,14 +552,14 @@ def _get_hnsw_index_ddl(
     distance_part = f" DISTANCE {distance_strategy}"
 
     parameters_part = ""
-    if "neighbors" in config and "efConstruction" in config:
-        parameters_part = " parameters (type {idx_type}, neighbors {neighbors}, efConstruction {efConstruction})"
-    elif "neighbors" in config and "efConstruction" not in config:
-        config["efConstruction"] = defaults["efConstruction"]
-        parameters_part = " parameters (type {idx_type}, neighbors {neighbors}, efConstruction {efConstruction})"
-    elif "neighbors" not in config and "efConstruction" in config:
+    if "neighbors" in config and "efconstruction" in config:
+        parameters_part = " parameters (type {idx_type}, neighbors {neighbors}, efconstruction {efconstruction})"
+    elif "neighbors" in config and "efconstruction" not in config:
+        config["efconstruction"] = defaults["efconstruction"]
+        parameters_part = " parameters (type {idx_type}, neighbors {neighbors}, efconstruction {efconstruction})"
+    elif "neighbors" not in config and "efconstruction" in config:
         config["neighbors"] = defaults["neighbors"]
-        parameters_part = " parameters (type {idx_type}, neighbors {neighbors}, efConstruction {efConstruction})"
+        parameters_part = " parameters (type {idx_type}, neighbors {neighbors}, efconstruction {efconstruction})"
 
     # always included part for parallel
     parallel_part = " parallel {parallel}"
@@ -464,12 +600,15 @@ def _get_ivf_index_ddl(
     defaults = {
         "idx_name": "IVF",
         "idx_type": "IVF",
-        "neighbor_part": 32,
+        "neighbor_partitions": 32,
         "accuracy": 90,
         "parallel": 8,
     }
+    allowed_keys = set(defaults) | {"samples_per_partition", "min_vectors_per_partition"}
 
-    if params:
+    if params is not None:
+        if not isinstance(params, dict):
+            raise ValueError("params must be a dictionary.")
         config = params.copy()
         # ensure compulsory parts are included
         for compulsory_key in ["idx_name", "parallel"]:
@@ -479,15 +618,26 @@ def _get_ivf_index_ddl(
                 else:
                     config[compulsory_key] = defaults[compulsory_key]
 
-        # validate keys in config against defaults
-        for key in config:
-            if key not in defaults:
-                raise ValueError(f"Invalid parameter: {key}")
+        _validate_allowed_params(config, allowed_keys)
     else:
-        config = defaults
+        config = defaults.copy()
         config["idx_name"] = _get_index_name(str(config["idx_name"]))
 
+    if {
+        "neighbor_partitions",
+        "samples_per_partition",
+        "min_vectors_per_partition",
+    } & set(config) and "idx_type" not in config:
+        config["idx_type"] = defaults["idx_type"]
+    _validate_index_type(config, "IVF")
+    _validate_int_param(config, "accuracy", 1, 100)
+    _validate_int_param(config, "neighbor_partitions", 1, 10000000)
+    _validate_int_param(config, "samples_per_partition", 1)
+    _validate_int_param(config, "min_vectors_per_partition", 0)
+    _validate_int_param(config, "parallel", 1)
+
     # base SQL statement
+    config["idx_name"] = _quote_identifier(config["idx_name"])
     idx_name = config["idx_name"]
     base_sql = f"CREATE VECTOR INDEX {idx_name} ON {table_name}({embedding_column}) ORGANIZATION NEIGHBOR PARTITIONS"
 
@@ -496,8 +646,13 @@ def _get_ivf_index_ddl(
     distance_part = f" DISTANCE {distance_strategy}"
 
     parameters_part = ""
-    if "idx_type" in config and "neighbor_part" in config:
-        parameters_part = f" PARAMETERS (type {config['idx_type']}, neighbor partitions {config['neighbor_part']})"
+    if "idx_type" in config and "neighbor_partitions" in config:
+        parameters_part = f" PARAMETERS (type {config['idx_type']}, neighbor partitions {config['neighbor_partitions']}"
+        if "samples_per_partition" in config:
+            parameters_part += f", samples_per_partition {config['samples_per_partition']}"
+        if "min_vectors_per_partition" in config:
+            parameters_part += f", min_vectors_per_partition {config['min_vectors_per_partition']}"
+        parameters_part += ")"
 
     # always included part for parallel
     parallel_part = f" PARALLEL {config['parallel']}"
@@ -794,19 +949,23 @@ def _get_hybrid_index_ddl(
     filter_by_str = ""
     filter_by = params.get("filter_by")
     if filter_by:
-        filter_by_str = "FILTER BY " + ",".join(filter_by) + " "
+        filter_by_str = "FILTER BY " + _quote_hybrid_identifier_list(filter_by, "filter_by") + " "
 
     order_by_str = ""
     order_by = params.get("order_by")
     order_by_asc = params.get("order_by_asc", True)
+    if not isinstance(order_by_asc, bool):
+        raise ValueError("order_by_asc must be a boolean.")
     if order_by:
-        order_by_str = "ORDER BY " + ",".join(order_by) + f" {'ASC' if order_by_asc else 'DESC'} "
+        order_by_str = (
+            "ORDER BY " + _quote_hybrid_identifier_list(order_by, "order_by") + f" {'ASC' if order_by_asc else 'DESC'} "
+        )
 
     parallel_str = ""
     parallel = params.get("parallel")
     if parallel is not None:
-        if not isinstance(parallel, int):
-            raise ValueError("parallel must be int")
+        if isinstance(parallel, bool) or not isinstance(parallel, int) or parallel <= 0:
+            raise ValueError("parallel must be a positive integer.")
         parallel_str = f"PARALLEL {parallel} "
 
     escaped_params_str = params_str.replace("'", "''")
@@ -841,7 +1000,8 @@ class OracleDocumentStore:
 
         :param connection_params: Connection parameters for python-oracledb. These are passed to
             `oracledb.connect()`, `oracledb.connect_async()`, `oracledb.create_pool()`, or
-            `oracledb.create_pool_async()` depending on the selected mode.
+            `oracledb.create_pool_async()` depending on the selected mode. Values can be Haystack `Secret`
+            instances to avoid serializing raw credentials.
         :param table_name: Oracle table name used to store Haystack documents.
         :param use_connection_pool: If `True`, create and use an Oracle connection pool.
         :param embedding_dim: Optional dense and sparse embedding dimension for Oracle VECTOR columns.
@@ -861,7 +1021,7 @@ class OracleDocumentStore:
         # Store the params for marshalling
         self._connection_params = connection_params
         self._use_connection_pool = use_connection_pool
-        self._table_name = _quote_indentifier(table_name)
+        self._table_name = _quote_identifier(table_name)
         self._embedding_dim = embedding_dim
         self._support_sparse_embeddings = support_sparse_embeddings
         self._create_vector_index = create_vector_index
@@ -921,10 +1081,11 @@ class OracleDocumentStore:
                 must be >=2.2.0 for vector support"
             )
 
+        resolved_connection_params = _resolve_connection_params(self._connection_params)
         if self._use_connection_pool:
-            self._client = oracledb.create_pool(**self._connection_params)
+            self._client = oracledb.create_pool(**resolved_connection_params)
         else:
-            self._client = oracledb.connect(**self._connection_params)
+            self._client = oracledb.connect(**resolved_connection_params)
 
         with _get_connection(self._client) as connection:
             table_exists = _table_exists(connection, self._table_name)
@@ -959,11 +1120,12 @@ class OracleDocumentStore:
                 must be >=2.2.0 for vector support"
             )
 
+        resolved_connection_params = _resolve_connection_params(self._connection_params)
         if self._use_connection_pool:
-            pool = cast(Any, oracledb.create_pool_async(**self._connection_params))
+            pool = cast(Any, oracledb.create_pool_async(**resolved_connection_params))
             self._client_async = await pool if inspect.isawaitable(pool) else pool
         else:
-            self._client_async = await oracledb.connect_async(**self._connection_params)
+            self._client_async = await oracledb.connect_async(**resolved_connection_params)
 
         async def context(connection: oracledb.AsyncConnection) -> None:
             table_exists = await _table_exists_async(connection, self._table_name)
@@ -1546,7 +1708,7 @@ class OracleDocumentStore:
         self, connection: oracledb.AsyncConnection, params: dict[str, Any] | None = None
     ) -> None:
         if params and "idx_name" in params:
-            params["idx_name"] = _quote_indentifier(params["idx_name"])
+            params["idx_name"] = _quote_identifier(params["idx_name"])
 
         if params:
             if params["idx_type"] == "HNSW":
@@ -1571,7 +1733,7 @@ class OracleDocumentStore:
         distance_strategy: DistanceStrategy,
     ) -> None:
         if params and "idx_name" in params:
-            params["idx_name"] = _quote_indentifier(params["idx_name"])
+            params["idx_name"] = _quote_identifier(params["idx_name"])
 
         if params:
             if params["idx_type"] == "HNSW":
@@ -1589,7 +1751,7 @@ class OracleDocumentStore:
 
     def _create_index(self, connection: oracledb.Connection, params: dict[str, Any] | None = None) -> None:
         if params and "idx_name" in params:
-            params["idx_name"] = _quote_indentifier(params["idx_name"])
+            params["idx_name"] = _quote_identifier(params["idx_name"])
 
         if params:
             if params["idx_type"] == "HNSW":
@@ -1614,7 +1776,7 @@ class OracleDocumentStore:
         distance_strategy: DistanceStrategy,
     ) -> None:
         if params and "idx_name" in params:
-            params["idx_name"] = _quote_indentifier(params["idx_name"])
+            params["idx_name"] = _quote_identifier(params["idx_name"])
 
         if params:
             if params["idx_type"] == "HNSW":
@@ -1647,7 +1809,7 @@ class OracleDocumentStore:
 
         vectorizer_preference = cast(OracleVectorizerPreference, vectorizer_preference)
         try:
-            quoted_idx_name = _quote_indentifier(idx_name)
+            quoted_idx_name = _quote_identifier(idx_name)
             ddl = _get_hybrid_index_ddl(self._table_name, quoted_idx_name, vectorizer_preference, params)
 
             with _get_connection(self._client) as connection:
@@ -1679,7 +1841,7 @@ class OracleDocumentStore:
 
         vectorizer_preference = cast(OracleVectorizerPreference, vectorizer_preference)
         try:
-            quoted_idx_name = _quote_indentifier(idx_name)
+            quoted_idx_name = _quote_identifier(idx_name)
             ddl = _get_hybrid_index_ddl(self._table_name, quoted_idx_name, vectorizer_preference, params)
 
             async with _get_connection_async(self._client_async) as connection:
@@ -1693,7 +1855,7 @@ class OracleDocumentStore:
     @_handle_exceptions
     def create_text_index(self, idx_name: str, *, column_name: str = "content") -> None:
         self._ensure_initialized()
-        quoted_idx_name = _quote_indentifier(idx_name)
+        quoted_idx_name = _quote_identifier(idx_name)
         _validate_text_index_column(column_name)
 
         with _get_connection(self._client) as connection:
@@ -1702,7 +1864,7 @@ class OracleDocumentStore:
     @_handle_exceptions_async
     async def create_text_index_async(self, idx_name: str, *, column_name: str = "content") -> None:
         await self._ensure_initialized_async()
-        quoted_idx_name = _quote_indentifier(idx_name)
+        quoted_idx_name = _quote_identifier(idx_name)
         _validate_text_index_column(column_name)
 
         async with _get_connection_async(self._client_async) as connection:
@@ -1718,6 +1880,9 @@ class OracleDocumentStore:
         :returns:
             Deserialized component.
         """
+        connection_params = data.get("init_parameters", {}).get("connection_params")
+        if isinstance(connection_params, dict):
+            _deserialize_connection_params(connection_params)
         return default_from_dict(cls, data)
 
     def to_dict(self) -> dict[str, Any]:
@@ -1729,7 +1894,7 @@ class OracleDocumentStore:
         """
         return default_to_dict(
             self,
-            connection_params=self._connection_params,
+            connection_params=_serialize_connection_params(self._connection_params),
             table_name=self._table_name,
             use_connection_pool=self._use_connection_pool,
             embedding_dim=self._embedding_dim,

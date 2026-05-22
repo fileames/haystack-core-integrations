@@ -16,6 +16,7 @@ from haystack.testing.document_store import (
     FilterDocumentsTest,
     WriteDocumentsTest,
 )
+from haystack.utils import Secret
 
 from haystack_integrations.components.document_stores.oracle import OracleDocumentStore
 from haystack_integrations.components.document_stores.oracle.document_store import _get_connection, _index_exists
@@ -362,7 +363,7 @@ def test_document_store_to_dict_serializes_index_config():
     assert store.to_dict() == {
         "type": "haystack_integrations.components.document_stores.oracle.document_store.OracleDocumentStore",
         "init_parameters": {
-            "connection_params": connection_params,
+            "connection_params": {"user": None, "password": None, "dsn": None},
             "table_name": '"docs"',
             "use_connection_pool": True,
             "embedding_dim": 768,
@@ -377,6 +378,29 @@ def test_document_store_to_dict_serializes_index_config():
                 "params": {"idx_name": "my_sparse_idx", "idx_type": "HNSW"},
             },
         },
+    }
+
+
+def test_document_store_to_dict_serializes_secret_connection_params():
+    store = OracleDocumentStore(
+        connection_params={
+            "user": Secret.from_env_var("ORACLE_USER"),
+            "password": Secret.from_env_var("ORACLE_PASSWORD"),
+            "dsn": Secret.from_env_var("ORACLE_DSN"),
+            "wallet_password": "wallet-secret",
+            "events": True,
+        },
+        table_name="docs",
+        embedding_dim=768,
+    )
+
+    serialized = store.to_dict()["init_parameters"]["connection_params"]
+    assert serialized == {
+        "user": {"type": "env_var", "env_vars": ["ORACLE_USER"], "strict": True},
+        "password": {"type": "env_var", "env_vars": ["ORACLE_PASSWORD"], "strict": True},
+        "dsn": {"type": "env_var", "env_vars": ["ORACLE_DSN"], "strict": True},
+        "wallet_password": None,
+        "events": True,
     }
 
 
@@ -419,3 +443,28 @@ def test_document_store_from_dict_roundtrip_preserves_index_config():
         "distance_strategy": "dot",
         "params": {"idx_name": "my_sparse_idx", "idx_type": "HNSW"},
     }
+
+
+def test_document_store_from_dict_deserializes_secret_connection_params(monkeypatch):
+    monkeypatch.setenv("ORACLE_USER", "onnxuser")
+    monkeypatch.setenv("ORACLE_PASSWORD", "secret")
+    monkeypatch.setenv("ORACLE_DSN", "database.example/pdb")
+
+    store = OracleDocumentStore.from_dict(
+        {
+            "type": "haystack_integrations.components.document_stores.oracle.document_store.OracleDocumentStore",
+            "init_parameters": {
+                "connection_params": {
+                    "user": {"type": "env_var", "env_vars": ["ORACLE_USER"], "strict": True},
+                    "password": {"type": "env_var", "env_vars": ["ORACLE_PASSWORD"], "strict": True},
+                    "dsn": {"type": "env_var", "env_vars": ["ORACLE_DSN"], "strict": True},
+                },
+                "table_name": "docs",
+                "embedding_dim": 768,
+            },
+        }
+    )
+
+    assert store._connection_params["user"].resolve_value() == "onnxuser"
+    assert store._connection_params["password"].resolve_value() == "secret"
+    assert store._connection_params["dsn"].resolve_value() == "database.example/pdb"
