@@ -404,6 +404,23 @@ def test_document_store_to_dict_serializes_secret_connection_params():
     }
 
 
+def test_document_store_to_dict_omits_non_string_sensitive_connection_params():
+    store = OracleDocumentStore(
+        connection_params={
+            "access_token": ("token-value", "private-key-value"),
+            "events": True,
+        },
+        table_name="docs",
+        embedding_dim=768,
+    )
+
+    serialized = store.to_dict()["init_parameters"]["connection_params"]
+    assert serialized == {
+        "access_token": None,
+        "events": True,
+    }
+
+
 def test_document_store_from_dict_roundtrip_preserves_index_config():
     connection_params = oracle_unit_test_connection_params()
     store = OracleDocumentStore.from_dict(

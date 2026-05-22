@@ -360,7 +360,9 @@ def _is_sensitive_connection_string(value: str) -> bool:
 def _serialize_connection_param(key: str, value: Any) -> Any:
     if isinstance(value, Secret):
         return value.to_dict()
-    if isinstance(value, str) and (_is_sensitive_connection_key(key) or _is_sensitive_connection_string(value)):
+    if _is_sensitive_connection_key(key):
+        return None
+    if isinstance(value, str) and _is_sensitive_connection_string(value):
         return None
     return value
 
