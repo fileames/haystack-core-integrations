@@ -159,6 +159,38 @@ def test_run_delegates_to_document_store():
     assert result == {"documents": []}
 
 
+@pytest.mark.parametrize("bad_top_k", ["1 ROWS ONLY --", True, False, 0, -1])
+def test_run_rejects_invalid_top_k(bad_top_k):
+    mock_store = Mock(spec=OracleDocumentStore)
+    retriever = OracleTextRetriever(document_store=mock_store)
+
+    with pytest.raises(ValueError, match="top_k must be a positive integer"):
+        retriever.run(query="refund policy", top_k=bad_top_k)
+
+    mock_store._text_retrieval.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_top_k", ["1 ROWS ONLY --", True, False, 0, -1])
+async def test_run_async_rejects_invalid_top_k(bad_top_k):
+    mock_store = Mock(spec=OracleDocumentStore)
+    mock_store._text_retrieval_async = AsyncMock(return_value=[])
+    retriever = OracleTextRetriever(document_store=mock_store)
+
+    with pytest.raises(ValueError, match="top_k must be a positive integer"):
+        await retriever.run_async(query="refund policy", top_k=bad_top_k)
+
+    mock_store._text_retrieval_async.assert_not_awaited()
+
+
+@pytest.mark.parametrize("bad_top_k", ["1 ROWS ONLY --", True, False, 0, -1])
+def test_init_rejects_invalid_top_k(bad_top_k):
+    mock_store = Mock(spec=OracleDocumentStore)
+
+    with pytest.raises(ValueError, match="top_k must be a positive integer"):
+        OracleTextRetriever(document_store=mock_store, top_k=bad_top_k)
+
+
 @pytest.mark.asyncio
 async def test_run_async_delegates_to_document_store():
     mock_store = Mock(spec=OracleDocumentStore)

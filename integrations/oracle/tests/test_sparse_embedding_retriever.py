@@ -144,6 +144,38 @@ def test_sparse_run_uses_instance_distance_strategy_when_not_overridden():
     )
 
 
+@pytest.mark.parametrize("bad_top_k", ["1 ROWS ONLY --", True, False, 0, -1])
+def test_sparse_run_rejects_invalid_top_k(bad_top_k):
+    mock_store = Mock(spec=OracleDocumentStore)
+    retriever = OracleSparseEmbeddingRetriever(document_store=mock_store)
+
+    with pytest.raises(ValueError, match="top_k must be a positive integer"):
+        retriever.run(query_sparse_embedding=SparseEmbedding(indices=[0], values=[1.0]), top_k=bad_top_k)
+
+    mock_store._embedding_retrieval.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_top_k", ["1 ROWS ONLY --", True, False, 0, -1])
+async def test_sparse_run_async_rejects_invalid_top_k(bad_top_k):
+    mock_store = Mock(spec=OracleDocumentStore)
+    mock_store._embedding_retrieval_async = AsyncMock(return_value=[])
+    retriever = OracleSparseEmbeddingRetriever(document_store=mock_store)
+
+    with pytest.raises(ValueError, match="top_k must be a positive integer"):
+        await retriever.run_async(query_sparse_embedding=SparseEmbedding(indices=[0], values=[1.0]), top_k=bad_top_k)
+
+    mock_store._embedding_retrieval_async.assert_not_awaited()
+
+
+@pytest.mark.parametrize("bad_top_k", ["1 ROWS ONLY --", True, False, 0, -1])
+def test_sparse_init_rejects_invalid_top_k(bad_top_k):
+    mock_store = Mock(spec=OracleDocumentStore)
+
+    with pytest.raises(ValueError, match="top_k must be a positive integer"):
+        OracleSparseEmbeddingRetriever(document_store=mock_store, top_k=bad_top_k)
+
+
 @pytest.mark.asyncio
 async def test_sparse_run_async_uses_instance_distance_strategy_when_not_overridden():
     mock_store = Mock(spec=OracleDocumentStore)

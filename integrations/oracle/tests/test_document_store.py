@@ -388,6 +388,7 @@ def test_document_store_to_dict_serializes_secret_connection_params():
             "password": Secret.from_env_var("ORACLE_PASSWORD"),
             "dsn": Secret.from_env_var("ORACLE_DSN"),
             "wallet_password": "wallet-secret",
+            "wallet_location": "/path/to/wallet",
             "events": True,
         },
         table_name="docs",
@@ -400,6 +401,7 @@ def test_document_store_to_dict_serializes_secret_connection_params():
         "password": {"type": "env_var", "env_vars": ["ORACLE_PASSWORD"], "strict": True},
         "dsn": {"type": "env_var", "env_vars": ["ORACLE_DSN"], "strict": True},
         "wallet_password": None,
+        "wallet_location": None,
         "events": True,
     }
 

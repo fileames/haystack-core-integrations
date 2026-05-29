@@ -11,6 +11,7 @@ from haystack.document_stores.types import FilterPolicy
 from haystack.document_stores.types.filter_policy import apply_filter_policy
 
 from haystack_integrations.components.document_stores.oracle import OracleDocumentStore
+from haystack_integrations.components.document_stores.oracle.document_store import _validate_top_k
 
 
 def _generate_accum_query(query: str, *, fuzzy: bool = False) -> str:
@@ -45,7 +46,7 @@ class OracleTextRetriever:
 
         self.document_store = document_store
         self.filters = filters or {}
-        self.top_k = top_k
+        self.top_k = _validate_top_k(top_k)
         self.fuzzy = fuzzy
         self.operator_search = operator_search
         self.return_scores = return_scores
@@ -100,7 +101,7 @@ class OracleTextRetriever:
         operator_search: Optional[bool] = None,
     ) -> dict[str, list[Document]]:
         filters = apply_filter_policy(self.filter_policy, self.filters, filters)
-        top_k = top_k or self.top_k
+        top_k = _validate_top_k(self.top_k if top_k is None else top_k)
         fuzzy = self.fuzzy if fuzzy is None else fuzzy
         operator_search = self.operator_search if operator_search is None else operator_search
         prepared_query = self._prepare_query(query, fuzzy=fuzzy, operator_search=operator_search)
@@ -124,7 +125,7 @@ class OracleTextRetriever:
         operator_search: Optional[bool] = None,
     ) -> dict[str, list[Document]]:
         filters = apply_filter_policy(self.filter_policy, self.filters, filters)
-        top_k = top_k or self.top_k
+        top_k = _validate_top_k(self.top_k if top_k is None else top_k)
         fuzzy = self.fuzzy if fuzzy is None else fuzzy
         operator_search = self.operator_search if operator_search is None else operator_search
         prepared_query = self._prepare_query(query, fuzzy=fuzzy, operator_search=operator_search)

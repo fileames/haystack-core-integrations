@@ -217,22 +217,23 @@ class OracleTextEmbedder:
                             # dereference string as array
                             vec = json.loads(rdata["embed_vector"])
                             embeddings.append(vec)
-                except BaseException:
+                except BaseException as embedding_error:
                     if proxy_was_set:
                         try:
                             cursor.execute("begin utl_http.set_proxy(:proxy); end;", proxy=None)
-                        except Exception:
-                            logger.exception("Failed to clear Oracle session proxy after embedding failed")
+                        except Exception as cleanup_error:
+                            msg = "Failed to clear Oracle session proxy after embedding failed"
+                            logger.exception("%s; original embedding error was: %r", msg, embedding_error)
+                            raise RuntimeError(msg) from cleanup_error
                     raise
                 else:
                     if proxy_was_set:
                         try:
                             cursor.execute("begin utl_http.set_proxy(:proxy); end;", proxy=None)
-                        except Exception:
-                            logger.warning(
-                                "Failed to clear Oracle session proxy after embedding succeeded",
-                                exc_info=True,
-                            )
+                        except Exception as cleanup_error:
+                            msg = "Failed to clear Oracle session proxy after embedding succeeded"
+                            logger.exception(msg)
+                            raise RuntimeError(msg) from cleanup_error
 
         return embeddings
 
@@ -285,22 +286,23 @@ class OracleTextEmbedder:
                             # dereference string as array
                             vec = json.loads(rdata["embed_vector"])
                             embeddings.append(vec)
-                except BaseException:
+                except BaseException as embedding_error:
                     if proxy_was_set:
                         try:
                             await cursor.execute("begin utl_http.set_proxy(:proxy); end;", proxy=None)
-                        except Exception:
-                            logger.exception("Failed to clear Oracle session proxy after embedding failed")
+                        except Exception as cleanup_error:
+                            msg = "Failed to clear Oracle session proxy after embedding failed"
+                            logger.exception("%s; original embedding error was: %r", msg, embedding_error)
+                            raise RuntimeError(msg) from cleanup_error
                     raise
                 else:
                     if proxy_was_set:
                         try:
                             await cursor.execute("begin utl_http.set_proxy(:proxy); end;", proxy=None)
-                        except Exception:
-                            logger.warning(
-                                "Failed to clear Oracle session proxy after embedding succeeded",
-                                exc_info=True,
-                            )
+                        except Exception as cleanup_error:
+                            msg = "Failed to clear Oracle session proxy after embedding succeeded"
+                            logger.exception(msg)
+                            raise RuntimeError(msg) from cleanup_error
 
                 return embeddings
 

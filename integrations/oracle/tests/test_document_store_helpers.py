@@ -471,6 +471,11 @@ def test_index_ddl_builders():
     assert "neighbors 32" in ddl
     assert "efconstruction 10" in ddl
 
+    _, ddl = ds._get_hnsw_index_ddl("docs", "dot", {})
+    assert "WITH TARGET ACCURACY 90" in ddl
+    assert "neighbors 32" in ddl
+    assert "efconstruction 200" in ddl
+
     with pytest.raises(ValueError, match="Invalid parameter"):
         ds._get_hnsw_index_ddl("docs", "dot", {"idx_type": "HNSW", "bogus": 1})
 
@@ -501,6 +506,10 @@ def test_index_ddl_builders():
     assert "neighbor partitions 64" in ddl
     assert "samples_per_partition 8" in ddl
     assert "min_vectors_per_partition 2" in ddl
+
+    _, ddl = ds._get_ivf_index_ddl("docs", "dot", {})
+    assert "WITH TARGET ACCURACY 90" in ddl
+    assert "neighbor partitions 32" in ddl
 
     with pytest.raises(ValueError, match="Invalid parameter"):
         ds._get_ivf_index_ddl("docs", "dot", {"idx_type": "IVF", "bogus": 1})
@@ -659,6 +668,80 @@ def test_document_store_internal_helpers(monkeypatch):
     store._initialized = True
     with pytest.raises(ValueError, match="Sparse embeddings are not supported"):
         store._embedding_retrieval(SparseEmbedding(indices=[0], values=[1.0]))
+
+
+@pytest.mark.parametrize("bad_top_k", ["1 ROWS ONLY --", True, False, 0, -1])
+def test_document_store_embedding_retrieval_rejects_invalid_top_k(monkeypatch, bad_top_k):
+    store = ds.OracleDocumentStore(
+        connection_params=oracle_unit_test_connection_params(),
+        table_name="docs",
+        embedding_dim=4,
+    )
+    store._initialized = True
+    store._client = object()
+    cursor = _ExecCursor(
+        description=[
+            SimpleNamespace(name=name)
+            for name in (
+                "ID",
+                "CONTENT",
+                "BLOB_DATA",
+                "BLOB_META",
+                "BLOB_MIME_TYPE",
+                "META",
+                "SCORE",
+                "EMBEDDING",
+            )
+        ],
+    )
+
+    @contextmanager
+    def connection(_client):
+        yield _Connection(cursor)
+
+    monkeypatch.setattr(ds, "_get_connection", connection)
+
+    with pytest.raises(ValueError, match="top_k must be a positive integer"):
+        store._embedding_retrieval([0.1, 0.2], top_k=bad_top_k)
+
+    assert cursor.executed == []
+
+
+@pytest.mark.parametrize("bad_top_k", ["1 ROWS ONLY --", True, False, 0, -1])
+def test_document_store_text_retrieval_rejects_invalid_top_k(monkeypatch, bad_top_k):
+    store = ds.OracleDocumentStore(
+        connection_params=oracle_unit_test_connection_params(),
+        table_name="docs",
+        embedding_dim=4,
+    )
+    store._initialized = True
+    store._client = object()
+    cursor = _ExecCursor(
+        description=[
+            SimpleNamespace(name=name)
+            for name in (
+                "ID",
+                "CONTENT",
+                "BLOB_DATA",
+                "BLOB_META",
+                "BLOB_MIME_TYPE",
+                "META",
+                "SCORE",
+                "EMBEDDING",
+            )
+        ],
+    )
+
+    @contextmanager
+    def connection(_client):
+        yield _Connection(cursor)
+
+    monkeypatch.setattr(ds, "_get_connection", connection)
+
+    with pytest.raises(ValueError, match="top_k must be a positive integer"):
+        store._text_retrieval(query='"hello"', top_k=bad_top_k)
+
+    assert cursor.executed == []
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ from haystack.document_stores.types import FilterPolicy
 from haystack.document_stores.types.filter_policy import apply_filter_policy
 
 from haystack_integrations.components.document_stores.oracle import OracleDocumentStore
+from haystack_integrations.components.document_stores.oracle.document_store import _validate_top_k
 
 VALID_DISTANCE_FUNCTIONS = "dot", "euclidean", "cosine"
 
@@ -115,7 +116,7 @@ class OracleEmbeddingRetriever:
 
         self.document_store = document_store
         self.filters = filters or {}
-        self.top_k = top_k
+        self.top_k = _validate_top_k(top_k)
         self.distance_strategy = distance_strategy
         self.filter_policy = (
             filter_policy if isinstance(filter_policy, FilterPolicy) else FilterPolicy.from_str(filter_policy)
@@ -189,7 +190,7 @@ class OracleEmbeddingRetriever:
             raise ValueError(error_message)
 
         filters = apply_filter_policy(self.filter_policy, self.filters, filters)
-        top_k = top_k or self.top_k
+        top_k = _validate_top_k(self.top_k if top_k is None else top_k)
         distance_strategy = distance_strategy or self.distance_strategy
 
         docs = self.document_store._embedding_retrieval(
@@ -230,7 +231,7 @@ class OracleEmbeddingRetriever:
             raise ValueError(error_message)
 
         filters = apply_filter_policy(self.filter_policy, self.filters, filters)
-        top_k = top_k or self.top_k
+        top_k = _validate_top_k(self.top_k if top_k is None else top_k)
         distance_strategy = distance_strategy or self.distance_strategy
 
         docs = await self.document_store._embedding_retrieval_async(

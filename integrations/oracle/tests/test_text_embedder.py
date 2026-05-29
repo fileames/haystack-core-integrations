@@ -28,6 +28,7 @@ class _FakeCursor:
         self.rows = [(json.dumps({"embed_vector": json.dumps([0.1, 0.2])}),)]
         self.executed = []
         self.raise_on_embedding = None
+        self.raise_on_clear_proxy = None
 
     def __enter__(self):
         return self
@@ -36,10 +37,12 @@ class _FakeCursor:
         return None
 
     def execute(self, query, params=None, **kwargs):
-        if self.raise_on_embedding and "utl_to_embeddings" in query:
-            raise self.raise_on_embedding
         self.query = query
         self.executed.append((query, params, kwargs))
+        if self.raise_on_clear_proxy and "utl_http.set_proxy" in query and kwargs.get("proxy") is None:
+            raise self.raise_on_clear_proxy
+        if self.raise_on_embedding and "utl_to_embeddings" in query:
+            raise self.raise_on_embedding
 
     def setinputsizes(self, *args, **kwargs):
         return None
@@ -91,12 +94,15 @@ class _AsyncFakeCursor:
         self.rows = [(json.dumps({"embed_vector": json.dumps([0.1, 0.2])}),)]
         self.executed = []
         self.raise_on_embedding = None
+        self.raise_on_clear_proxy = None
 
     async def execute(self, query, params=None, **kwargs):
-        if self.raise_on_embedding and "utl_to_embeddings" in query:
-            raise self.raise_on_embedding
         self.query = query
         self.executed.append((query, params, kwargs))
+        if self.raise_on_clear_proxy and "utl_http.set_proxy" in query and kwargs.get("proxy") is None:
+            raise self.raise_on_clear_proxy
+        if self.raise_on_embedding and "utl_to_embeddings" in query:
+            raise self.raise_on_embedding
 
     def setinputsizes(self, *args, **kwargs):
         return None
@@ -425,6 +431,48 @@ def test_embed_documents_sync_proxy_cleared_on_exception(monkeypatch):
     assert released["value"] is True
 
 
+def test_embed_documents_sync_proxy_cleanup_failure_after_embedding_failure_raises(monkeypatch):
+    released = {"value": False}
+    connection = _FakeConnection()
+    connection.cursor_obj.raise_on_embedding = RuntimeError("embedding failed")
+    connection.cursor_obj.raise_on_clear_proxy = RuntimeError("clear failed")
+    pool = _FakePool(connection, released)
+
+    monkeypatch.setattr(oracledb, "ConnectionPool", _FakePool, raising=False)
+
+    embedder = OracleTextEmbedder(**{**default_params, "use_connection_pool": True, "proxy": "http://proxy"})
+    embedder._client = pool
+    embedder._initialized = True
+
+    with pytest.raises(RuntimeError, match="Failed to clear Oracle session proxy after embedding failed"):
+        embedder._embed_documents(["hello"])
+
+    assert [
+        kwargs.get("proxy")
+        for query, _params, kwargs in connection.cursor_obj.executed
+        if query == "begin utl_http.set_proxy(:proxy); end;"
+    ] == ["http://proxy", None]
+    assert released["value"] is True
+
+
+def test_embed_documents_sync_proxy_cleanup_failure_raises(monkeypatch):
+    released = {"value": False}
+    connection = _FakeConnection()
+    connection.cursor_obj.raise_on_clear_proxy = RuntimeError("clear failed")
+    pool = _FakePool(connection, released)
+
+    monkeypatch.setattr(oracledb, "ConnectionPool", _FakePool, raising=False)
+
+    embedder = OracleTextEmbedder(**{**default_params, "use_connection_pool": True, "proxy": "http://proxy"})
+    embedder._client = pool
+    embedder._initialized = True
+
+    with pytest.raises(RuntimeError, match="Failed to clear Oracle session proxy after embedding succeeded"):
+        embedder._embed_documents(["hello"])
+
+    assert released["value"] is True
+
+
 @pytest.mark.asyncio
 async def test_embed_documents_async_releases_pooled_connection(monkeypatch):
     released = {"value": False}
@@ -528,6 +576,50 @@ async def test_embed_documents_async_proxy_cleared_on_exception(monkeypatch):
         for query, _params, kwargs in connection.cursor_obj.executed
         if query == "begin utl_http.set_proxy(:proxy); end;"
     ] == ["http://proxy", None]
+    assert released["value"] is True
+
+
+@pytest.mark.asyncio
+async def test_embed_documents_async_proxy_cleanup_failure_after_embedding_failure_raises(monkeypatch):
+    released = {"value": False}
+    connection = _AsyncFakeConnection()
+    connection.cursor_obj.raise_on_embedding = RuntimeError("embedding failed")
+    connection.cursor_obj.raise_on_clear_proxy = RuntimeError("clear failed")
+    pool = _AsyncFakePool(connection, released)
+
+    monkeypatch.setattr(oracledb, "AsyncConnectionPool", _AsyncFakePool, raising=False)
+
+    embedder = OracleTextEmbedder(**{**default_params, "use_connection_pool": True, "proxy": "http://proxy"})
+    embedder._client_async = pool
+    embedder._initialized_async = True
+
+    with pytest.raises(RuntimeError, match="Failed to clear Oracle session proxy after embedding failed"):
+        await embedder._embed_documents_async(["hello"])
+
+    assert [
+        kwargs.get("proxy")
+        for query, _params, kwargs in connection.cursor_obj.executed
+        if query == "begin utl_http.set_proxy(:proxy); end;"
+    ] == ["http://proxy", None]
+    assert released["value"] is True
+
+
+@pytest.mark.asyncio
+async def test_embed_documents_async_proxy_cleanup_failure_raises(monkeypatch):
+    released = {"value": False}
+    connection = _AsyncFakeConnection()
+    connection.cursor_obj.raise_on_clear_proxy = RuntimeError("clear failed")
+    pool = _AsyncFakePool(connection, released)
+
+    monkeypatch.setattr(oracledb, "AsyncConnectionPool", _AsyncFakePool, raising=False)
+
+    embedder = OracleTextEmbedder(**{**default_params, "use_connection_pool": True, "proxy": "http://proxy"})
+    embedder._client_async = pool
+    embedder._initialized_async = True
+
+    with pytest.raises(RuntimeError, match="Failed to clear Oracle session proxy after embedding succeeded"):
+        await embedder._embed_documents_async(["hello"])
+
     assert released["value"] is True
 
 

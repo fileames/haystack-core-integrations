@@ -22,6 +22,7 @@ from haystack_integrations.components.document_stores.oracle.document_store impo
     _get_connection,
     _get_connection_async,
     _quote_identifier,
+    _validate_top_k,
     output_type_string_handler,
 )
 from haystack_integrations.components.document_stores.oracle.filters import _to_hybrid_filter
@@ -59,7 +60,7 @@ class OracleHybridRetriever:
         self.idx_name = _quote_identifier(idx_name)
         self.search_mode = search_mode
         self.filters = filters or {}
-        self.top_k = top_k
+        self.top_k = _validate_top_k(top_k)
         self.params = self._validate_params(params or {})
         self.return_scores = return_scores
         self.filter_policy = (
@@ -138,7 +139,7 @@ class OracleHybridRetriever:
             search_params["filter_by"] = _to_hybrid_filter(filters)
 
         search_params["return"] = {
-            "topN": top_k or self.top_k,
+            "topN": _validate_top_k(self.top_k if top_k is None else top_k),
             "values": ["rowid", "score", "vector_score", "text_score"],
             "format": "JSON",
         }

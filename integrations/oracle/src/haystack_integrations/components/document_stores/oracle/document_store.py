@@ -40,6 +40,7 @@ _SENSITIVE_CONNECTION_KEY_PARTS = (
     "secret",
     "token",
     "key",
+    "wallet",
     "credential",
 )
 
@@ -311,6 +312,12 @@ def _validate_int_param(
         raise ValueError(f"{key} must be at most {max_value}.")
 
 
+def _validate_top_k(top_k: Any) -> int:
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+        raise ValueError("top_k must be a positive integer.")
+    return top_k
+
+
 def _validate_allowed_params(config: dict[str, Any], allowed_keys: set[str]) -> None:
     for key in config:
         if key not in allowed_keys:
@@ -517,7 +524,7 @@ def _get_hnsw_index_ddl(
         "parallel": 8,
     }
 
-    if params is not None:
+    if params:
         if not isinstance(params, dict):
             raise ValueError("params must be a dictionary.")
         config = params.copy()
@@ -608,7 +615,7 @@ def _get_ivf_index_ddl(
     }
     allowed_keys = set(defaults) | {"samples_per_partition", "min_vectors_per_partition"}
 
-    if params is not None:
+    if params:
         if not isinstance(params, dict):
             raise ValueError("params must be a dictionary.")
         config = params.copy()
@@ -1525,6 +1532,7 @@ class OracleDocumentStore:
         distance_strategy: Optional[Literal["dot", "euclidean", "cosine"]] = "cosine",
     ) -> list[Document]:
         self._ensure_initialized()
+        top_k = _validate_top_k(top_k)
         where_clause = ""
         params: dict[str, Any]
 
@@ -1576,6 +1584,7 @@ class OracleDocumentStore:
         distance_strategy: Optional[Literal["dot", "euclidean", "cosine"]] = "cosine",
     ) -> list[Document]:
         await self._ensure_initialized_async()
+        top_k = _validate_top_k(top_k)
 
         async def context(
             connection: oracledb.AsyncConnection,
@@ -1631,6 +1640,7 @@ class OracleDocumentStore:
         top_k: int = 10,
     ) -> list[Document]:
         self._ensure_initialized()
+        top_k = _validate_top_k(top_k)
 
         params: dict[str, Any] = {"query": query}
         where_parts = ["CONTAINS(content, :query, 1) > 0"]
@@ -1670,6 +1680,7 @@ class OracleDocumentStore:
         top_k: int = 10,
     ) -> list[Document]:
         await self._ensure_initialized_async()
+        top_k = _validate_top_k(top_k)
 
         async def context(
             connection: oracledb.AsyncConnection,

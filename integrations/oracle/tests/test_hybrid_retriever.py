@@ -125,6 +125,10 @@ def test_hybrid_retriever_init_validation_and_params():
     with pytest.raises(ValueError, match="search_mode must be one of"):
         OracleHybridRetriever(document_store=store, idx_name="IDX_HYB", search_mode="bad")  # type: ignore[arg-type]
 
+    for bad_top_k in ("1 ROWS ONLY --", True, False, 0, -1):
+        with pytest.raises(ValueError, match="top_k must be a positive integer"):
+            OracleHybridRetriever(document_store=store, idx_name="IDX_HYB", top_k=bad_top_k)  # type: ignore[arg-type]
+
     for params in (
         {"search_text": "x"},
         {"return": {"topN": 3}},
@@ -155,6 +159,10 @@ def test_hybrid_retriever_search_params():
     assert params["vector"]["result_max"] == 20
     assert params["filter_by"] == {"op": "=", "path": "meta.topic", "type": "string", "args": ["science"]}
     assert params["return"] == {"topN": 3, "values": ["rowid", "score", "vector_score", "text_score"], "format": "JSON"}
+
+    for bad_top_k in ("1 ROWS ONLY --", True, False, 0, -1):
+        with pytest.raises(ValueError, match="top_k must be a positive integer"):
+            retriever._get_search_params("hello", top_k=bad_top_k)  # type: ignore[arg-type]
 
     semantic = OracleHybridRetriever(document_store=_make_store(), idx_name="IDX_HYB", search_mode="semantic")
     semantic_params = semantic._get_search_params("hello")
