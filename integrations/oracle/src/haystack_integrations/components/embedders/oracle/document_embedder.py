@@ -32,7 +32,7 @@ class OracleDocumentEmbedder(OracleTextEmbedder):
         embedding_params: dict[str, Any],
         *,
         use_connection_pool: bool = False,
-        proxy: Any | None,
+        proxy: Any | None = None,
         meta_fields_to_embed: list[str] = [],
         embedding_separator: str = "\n",
     ):
