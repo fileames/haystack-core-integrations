@@ -39,7 +39,7 @@ class OracleTextEmbedder:
         embedding_params: dict[str, Any],
         *,
         use_connection_pool: bool = False,
-        proxy: Any | None,
+        proxy: Any | None = None,
     ):
         """
         Creates a new OracleTextEmbedder component.
