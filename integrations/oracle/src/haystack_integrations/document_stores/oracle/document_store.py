@@ -18,10 +18,9 @@ from haystack import default_from_dict, default_to_dict
 from haystack.dataclasses import Document
 from haystack.document_stores.errors import DocumentStoreError, DuplicateDocumentError
 from haystack.document_stores.types import DuplicatePolicy
-from haystack.errors import FilterError
 from haystack.utils import Secret, deserialize_secrets_inplace
 
-from .filters import FilterTranslator, to_hybrid_filter
+from .filters import FilterTranslator
 
 logger = logging.getLogger(__name__)
 
@@ -893,21 +892,26 @@ class OracleDocumentStore:
         return written
 
     def _upsert_documents(self, documents: list[Document]) -> int:
-        sql = f"""
-            MERGE INTO {self.table_name} t
-            USING (SELECT :doc_id AS id FROM dual) s ON (t.id = s.id)
-            WHEN MATCHED THEN
-                UPDATE SET t.text = :doc_text, t.metadata = :doc_meta, t.embedding = :doc_emb
-            WHEN NOT MATCHED THEN
-                INSERT (id, text, metadata, embedding)
-                VALUES (s.id, :doc_text, :doc_meta, :doc_emb)
+        # A single MERGE combining WHEN MATCHED UPDATE with WHEN NOT MATCHED INSERT raises
+        # ORA-06531 ("reference to uninitialized collection") inside the DBMS_SEARCH
+        # keyword-index trigger on Oracle 23ai/26ai — even when every row is an insert.
+        # Delete-then-insert is an equivalent upsert that avoids the faulty trigger path.
+        # Rows are de-duplicated by id (last one wins) so a batch that repeats an id cannot
+        # violate the primary key after the deletes are applied.
+        rows_by_id: dict[str, dict[str, Any]] = {}
+        for document in documents:
+            rows_by_id[document.id] = OracleDocumentStore._to_named_row(document)
+        rows = list(rows_by_id.values())
+        delete_sql = f"DELETE FROM {self.table_name} WHERE id = :doc_id"
+        insert_sql = f"""
+            INSERT INTO {self.table_name} (id, text, metadata, embedding)
+            VALUES (:doc_id, :doc_text, :doc_meta, :doc_emb)
         """
-        rows = [OracleDocumentStore._to_named_row(d) for d in documents]
         with self._get_connection() as conn, conn.cursor() as cur:
-            cur.executemany(sql, rows)
-            written = cur.rowcount
+            cur.executemany(delete_sql, [{"doc_id": row["doc_id"]} for row in rows])
+            cur.executemany(insert_sql, rows)
             conn.commit()
-        return written
+        return len(rows)
 
     async def write_documents_async(
         self,
@@ -926,12 +930,19 @@ class OracleDocumentStore:
         return await asyncio.to_thread(self.write_documents, documents, policy)
 
     @staticmethod
-    def _build_where(filters: dict[str, Any] | None) -> tuple[str, dict[str, Any]]:
+    def _build_filter_fragment(filters: dict[str, Any] | None) -> tuple[str, dict[str, Any]]:
         if not filters:
             return "", {}
         params: dict[str, Any] = {}
         counter = [0]
         fragment = FilterTranslator().translate(filters, params, counter)
+        return fragment, params
+
+    @staticmethod
+    def _build_where(filters: dict[str, Any] | None) -> tuple[str, dict[str, Any]]:
+        fragment, params = OracleDocumentStore._build_filter_fragment(filters)
+        if not fragment:
+            return "", {}
         return f"WHERE {fragment}", params
 
     def filter_documents(self, filters: dict[str, Any] | None = None) -> list[Document]:
@@ -1411,10 +1422,13 @@ class OracleDocumentStore:
         *,
         index_name: str,
         search_mode: Literal["keyword", "hybrid", "semantic"],
-        filters: dict[str, Any] | None,
         top_k: int,
         params: dict[str, Any] | None,
     ) -> dict[str, Any]:
+        # Haystack metadata filters are applied as a SQL predicate after ranking (see
+        # _hybrid_retrieval); they are not translated into DBMS_HYBRID_VECTOR ``filter_by``,
+        # whose paths resolve to base-table columns rather than JSON metadata fields. A native
+        # ``filter_by`` over declared filterable columns can still be supplied via ``params``.
         if search_mode not in _VALID_HYBRID_SEARCH_MODES:
             msg = f"search_mode must be one of {_VALID_HYBRID_SEARCH_MODES}, got {search_mode!r}"
             raise ValueError(msg)
@@ -1428,12 +1442,6 @@ class OracleDocumentStore:
         if search_mode in {"hybrid", "keyword"}:
             search_params["text"] = dict(search_params.get("text") or {})
             search_params["text"]["search_text"] = query
-
-        if filters:
-            if "filter_by" in search_params:
-                msg = "Cannot combine Haystack filters with params['filter_by']."
-                raise FilterError(msg)
-            search_params["filter_by"] = to_hybrid_filter(filters)
 
         search_params["return"] = {
             "topN": top_k,
@@ -1468,25 +1476,32 @@ class OracleDocumentStore:
             query,
             index_name=index_name,
             search_mode=search_mode,
-            filters=filters,
             top_k=top_k,
             params=params,
         )
+        # DBMS_HYBRID_VECTOR ranks the hits; Haystack metadata filters are applied here as a
+        # SQL predicate while fetching each ranked row. Because filtering happens after ranking,
+        # fewer than top_k documents may be returned.
+        filter_fragment, filter_params = OracleDocumentStore._build_filter_fragment(filters)
+        row_sql = f"SELECT id, text, JSON_SERIALIZE(metadata) AS metadata FROM {self.table_name} WHERE ROWID = :rid"
+        if filter_fragment:
+            row_sql += f" AND ({filter_fragment})"
 
         rows: list[tuple[Any, ...]] = []
+        matched_rows: list[dict[str, Any]] = []
         with self._get_connection() as conn, conn.cursor() as cur:
             cur.setinputsizes(search_params=oracledb.DB_TYPE_JSON)
             cur.execute("SELECT DBMS_HYBRID_VECTOR.SEARCH(JSON(:search_params))", search_params=search_params)
             search_rows = self._decode_hybrid_search_result(cur.fetchone()[0])
             for row in search_rows:
-                cur.execute(
-                    f"SELECT id, text, JSON_SERIALIZE(metadata) AS metadata FROM {self.table_name} WHERE ROWID = :rid",
-                    rid=row["rowid"],
-                )
-                rows.extend(cur.fetchall())
+                cur.execute(row_sql, {"rid": row["rowid"], **filter_params})
+                fetched = cur.fetchall()
+                if fetched:
+                    rows.extend(fetched)
+                    matched_rows.append(row)
 
         documents = [OracleDocumentStore._row_to_document(row) for row in rows]
-        self._merge_hybrid_scores(search_rows, documents, return_scores=return_scores)
+        self._merge_hybrid_scores(matched_rows, documents, return_scores=return_scores)
         return documents
 
     async def _hybrid_retrieval_async(
@@ -1516,12 +1531,17 @@ class OracleDocumentStore:
             query,
             index_name=index_name,
             search_mode=search_mode,
-            filters=filters,
             top_k=top_k,
             params=params,
         )
+        # See _hybrid_retrieval: filters are applied as a SQL predicate after ranking.
+        filter_fragment, filter_params = OracleDocumentStore._build_filter_fragment(filters)
+        row_sql = f"SELECT id, text, JSON_SERIALIZE(metadata) AS metadata FROM {self.table_name} WHERE ROWID = :rid"
+        if filter_fragment:
+            row_sql += f" AND ({filter_fragment})"
 
         rows: list[tuple[Any, ...]] = []
+        matched_rows: list[dict[str, Any]] = []
         pool = await self._get_async_pool()
         async with pool.acquire() as conn:
             with conn.cursor() as cur:
@@ -1534,17 +1554,14 @@ class OracleDocumentStore:
                 )
                 search_rows = await self._decode_hybrid_search_result_async((await _maybe_await(cur.fetchone()))[0])
                 for row in search_rows:
-                    await _maybe_await(
-                        cur.execute(
-                            "SELECT id, text, JSON_SERIALIZE(metadata) AS metadata "
-                            f"FROM {self.table_name} WHERE ROWID = :rid",
-                            rid=row["rowid"],
-                        )
-                    )
-                    rows.extend(await _maybe_await(cur.fetchall()))
+                    await _maybe_await(cur.execute(row_sql, {"rid": row["rowid"], **filter_params}))
+                    fetched = await _maybe_await(cur.fetchall())
+                    if fetched:
+                        rows.extend(fetched)
+                        matched_rows.append(row)
 
         documents = [OracleDocumentStore._row_to_document(row) for row in rows]
-        self._merge_hybrid_scores(search_rows, documents, return_scores=return_scores)
+        self._merge_hybrid_scores(matched_rows, documents, return_scores=return_scores)
         return documents
 
     def _embedding_retrieval(

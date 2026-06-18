@@ -35,6 +35,8 @@ from haystack_integrations.document_stores.oracle import OracleConnectionConfig,
 _USER = os.getenv("ORACLE_USER") or os.getenv("VECDB_USER") or "haystack"
 _PASSWORD = os.getenv("ORACLE_PASSWORD") or os.getenv("VECDB_PASS") or "haystack"
 _DSN = os.getenv("ORACLE_DSN") or os.getenv("ORACLE_DB_DSN") or os.getenv("VECDB_HOST") or "localhost:1521/freepdb1"
+_WALLET_LOCATION = os.getenv("ORACLE_WALLET_LOCATION")
+_WALLET_PASSWORD = os.getenv("ORACLE_WALLET_PASSWORD")
 
 
 def _doc(doc_id: str, content: str = "hello", meta: dict | None = None, embedding: list[float] | None = None):
@@ -75,6 +77,8 @@ class TestOracleDocumentStore(
                 user=Secret.from_token(_USER),
                 password=Secret.from_token(_PASSWORD),
                 dsn=Secret.from_token(_DSN),
+                wallet_location=_WALLET_LOCATION,
+                wallet_password=Secret.from_token(_WALLET_PASSWORD) if _WALLET_PASSWORD else None,
             ),
             table_name=table,
             embedding_dim=768,
@@ -140,13 +144,19 @@ class TestOracleDocumentStore(
         assert "WHEN NOT MATCHED" in sql
         assert "WHEN MATCHED" not in sql
 
-    def test_write_documents_overwrite_policy_uses_full_merge(self, patched_store, mock_pool):
+    def test_write_documents_overwrite_policy_deletes_then_inserts(self, patched_store, mock_pool):
+        # OVERWRITE uses delete-then-insert instead of a MERGE, because a MERGE combining
+        # WHEN MATCHED UPDATE with WHEN NOT MATCHED INSERT raises ORA-06531 in the DBMS_SEARCH
+        # keyword-index trigger on Oracle 23ai/26ai.
         _, _, cursor = mock_pool
         patched_store.write_documents([self._mock_doc()], policy=DuplicatePolicy.OVERWRITE)
-        sql = cursor.executemany.call_args[0][0]
-        assert "MERGE INTO" in sql
-        assert "WHEN MATCHED" in sql
-        assert "WHEN NOT MATCHED" in sql
+        assert cursor.executemany.call_count == 2
+        delete_sql = cursor.executemany.call_args_list[0][0][0]
+        insert_sql = cursor.executemany.call_args_list[1][0][0]
+        assert "DELETE FROM" in delete_sql
+        assert "INSERT INTO" in insert_sql
+        assert "MERGE" not in delete_sql
+        assert "MERGE" not in insert_sql
 
     def test_write_documents_returns_count(self, patched_store, mock_pool):  # noqa: ARG002
         count = patched_store.write_documents(

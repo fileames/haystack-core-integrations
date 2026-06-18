@@ -316,3 +316,66 @@ def test_hybrid_retriever_live() -> None:
                     preference.drop()
         finally:
             store.close()
+
+
+def test_hybrid_retriever_with_metadata_filter_live() -> None:
+    text_embedder = _text_embedder()
+    document_embedder = _document_embedder()
+    query_embedding = text_embedder.run("Oracle hybrid vector search")["embedding"]
+    store = OracleDocumentStore(
+        connection_config=_connection_config(),
+        table_name=_table_name("HS_HYBF"),
+        embedding_dim=len(query_embedding),
+        distance_metric="COSINE",
+        create_table_if_not_exists=True,
+    )
+    preference: OracleVectorizerPreference | None = None
+    try:
+        docs = document_embedder.run(
+            [
+                Document(content="Oracle hybrid vector search in English.", meta={"title": "Oracle", "lang": "en"}),
+                Document(content="Oracle hybrid vector search auf Deutsch.", meta={"title": "Oracle", "lang": "de"}),
+            ]
+        )["documents"]
+        store.write_documents(docs, policy=DuplicatePolicy.NONE)
+        preference = store.create_hybrid_vector_index(f"{store.table_name}_HIDX", text_embedder=text_embedder)
+
+        result = OracleHybridRetriever(
+            document_store=store,
+            index_name=f"{store.table_name}_HIDX",
+            search_mode="hybrid",
+            top_k=10,
+            filters={"field": "meta.lang", "operator": "==", "value": "en"},
+        ).run("Oracle hybrid vector search")
+
+        returned_langs = {doc.meta.get("lang") for doc in result["documents"]}
+        assert returned_langs == {"en"}
+    finally:
+        try:
+            try:
+                _drop_table(store)
+            finally:
+                if preference is not None:
+                    preference.drop()
+        finally:
+            store.close()
+
+
+def test_write_documents_overwrite_policy_live() -> None:
+    with _temporary_store(prefix="HS_OVW") as store:
+        store.write_documents(
+            [Document(id="dup", content="first", meta={"v": 1}, embedding=[0.1, 0.2, 0.3, 0.4])],
+            policy=DuplicatePolicy.NONE,
+        )
+
+        written = store.write_documents(
+            [Document(id="dup", content="second", meta={"v": 2}, embedding=[0.5, 0.6, 0.7, 0.8])],
+            policy=DuplicatePolicy.OVERWRITE,
+        )
+
+        assert written == 1
+        assert store.count_documents() == 1
+        stored = store.filter_documents({"field": "id", "operator": "==", "value": "dup"})
+        assert len(stored) == 1
+        assert stored[0].content == "second"
+        assert stored[0].meta["v"] == 2

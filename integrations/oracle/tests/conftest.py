@@ -15,6 +15,8 @@ from haystack_integrations.document_stores.oracle import OracleConnectionConfig,
 _USER = os.getenv("ORACLE_USER") or os.getenv("VECDB_USER") or "haystack"
 _PASSWORD = os.getenv("ORACLE_PASSWORD") or os.getenv("VECDB_PASS") or "haystack"
 _DSN = os.getenv("ORACLE_DSN") or os.getenv("ORACLE_DB_DSN") or os.getenv("VECDB_HOST") or "localhost:1521/freepdb1"
+_WALLET_LOCATION = os.getenv("ORACLE_WALLET_LOCATION")
+_WALLET_PASSWORD = os.getenv("ORACLE_WALLET_PASSWORD")
 
 
 def _make_store(table: str, embedding_dim: int) -> OracleDocumentStore:
@@ -23,6 +25,8 @@ def _make_store(table: str, embedding_dim: int) -> OracleDocumentStore:
             user=Secret.from_token(_USER),
             password=Secret.from_token(_PASSWORD),
             dsn=Secret.from_token(_DSN),
+            wallet_location=_WALLET_LOCATION,
+            wallet_password=Secret.from_token(_WALLET_PASSWORD) if _WALLET_PASSWORD else None,
         ),
         table_name=table,
         embedding_dim=embedding_dim,
